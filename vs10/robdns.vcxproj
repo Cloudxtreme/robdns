@@ -24,6 +24,17 @@
     <ClCompile Include="..\src\adapter-recv.c" />
     <ClCompile Include="..\src\adapter-xmit.c" />
     <ClCompile Include="..\src\adapter.c" />
+    <ClCompile Include="..\src\conf-addrlist.c" />
+    <ClCompile Include="..\src\conf-keys.c" />
+    <ClCompile Include="..\src\conf-load.c" />
+    <ClCompile Include="..\src\conf-load-options.c" />
+    <ClCompile Include="..\src\conf-parse.c" />
+    <ClCompile Include="..\src\conf-selftest.c" />
+    <ClCompile Include="..\src\conf-trackfile.c" />
+    <ClCompile Include="..\src\conf-zone.c" />
+    <ClCompile Include="..\src\conf-zonedir.c" />
+    <ClCompile Include="..\src\configuration.c" />
+    <ClCompile Include="..\src\crypto-base64.c" />
     <ClCompile Include="..\src\crypto-md5.c" />
     <ClCompile Include="..\src\crypto-murmur3.c" />
     <ClCompile Include="..\src\crypto-siphash.c" />
@@ -34,16 +45,20 @@
     <ClCompile Include="..\src\grind-config.c" />
     <ClCompile Include="..\src\grind.c" />
     <ClCompile Include="..\src\logger.c" />
+    <ClCompile Include="..\src\main-checkconf.c" />
     <ClCompile Include="..\src\main-checkzone.c" />
     <ClCompile Include="..\src\main-conf.c" />
     <ClCompile Include="..\src\main-listif.c" />
     <ClCompile Include="..\src\main-pcap2zone.c" />
     <ClCompile Include="..\src\main-regression.c" />
+    <ClCompile Include="..\src\main-server-socket.c" />
     <ClCompile Include="..\src\main-server.c" />
-    <ClCompile Include="..\src\main-slowsockets.c" />
     <ClCompile Include="..\src\main-thread.c" />
     <ClCompile Include="..\src\main.c" />
+    <ClCompile Include="..\src\perftest.c" />
     <ClCompile Include="..\src\pixie-nic.c" />
+    <ClCompile Include="..\src\pixie-threads.c" />
+    <ClCompile Include="..\src\pixie-timer.c" />
     <ClCompile Include="..\src\pixie.c" />
     <ClCompile Include="..\src\proto-arp.c" />
     <ClCompile Include="..\src\proto-dns-compressor.c" />
@@ -56,12 +71,20 @@
     <ClCompile Include="..\src\rawsock-pfring.c" />
     <ClCompile Include="..\src\rawsock.c" />
     <ClCompile Include="..\src\resolver.c" />
+    <ClCompile Include="..\src\rte-ring.c" />
     <ClCompile Include="..\src\selftest-parsefast.c" />
     <ClCompile Include="..\src\selftest.c" />
+    <ClCompile Include="..\src\smack1.c" />
+    <ClCompile Include="..\src\smackqueue.c" />
     <ClCompile Include="..\src\string_s.c" />
+    <ClCompile Include="..\src\thread-worker.c" />
     <ClCompile Include="..\src\util-filename.c" />
     <ClCompile Include="..\src\util-ipaddr.c" />
     <ClCompile Include="..\src\util-keyword.c" />
+    <ClCompile Include="..\src\util-realloc2.c" />
+    <ClCompile Include="..\src\zonefile-field-charstring.c" />
+    <ClCompile Include="..\src\zonefile-field-loc.c" />
+    <ClCompile Include="..\src\zonefile-insertion.c" />
     <ClCompile Include="..\src\zonefile-dfa.c" />
     <ClCompile Include="..\src\zonefile-fields.c" />
     <ClCompile Include="..\src\zonefile-load.c" />
@@ -73,6 +96,16 @@
     <ClInclude Include="..\src\adapter-pcapfile.h" />
     <ClInclude Include="..\src\adapter-pcaplive.h" />
     <ClInclude Include="..\src\adapter.h" />
+    <ClInclude Include="..\src\conf-addrlist.h" />
+    <ClInclude Include="..\src\conf-error.h" />
+    <ClInclude Include="..\src\conf-keys.h" />
+    <ClInclude Include="..\src\conf-load.h" />
+    <ClInclude Include="..\src\conf-parse.h" />
+    <ClInclude Include="..\src\conf-trackfile.h" />
+    <ClInclude Include="..\src\conf-zone.h" />
+    <ClInclude Include="..\src\configuration-adapter.h" />
+    <ClInclude Include="..\src\configuration.h" />
+    <ClInclude Include="..\src\crypto-base64.h" />
     <ClInclude Include="..\src\crypto-md5.h" />
     <ClInclude Include="..\src\crypto-murmur3.h" />
     <ClInclude Include="..\src\crypto-siphash.h" />
@@ -87,10 +120,15 @@
     <ClInclude Include="..\src\logger.h" />
     <ClInclude Include="..\src\main-conf.h" />
     <ClInclude Include="..\src\main-regression.h" />
+    <ClInclude Include="..\src\main-server-socket.h" />
     <ClInclude Include="..\src\main-thread.h" />
     <ClInclude Include="..\src\network.h" />
     <ClInclude Include="..\src\packet.h" />
+    <ClInclude Include="..\src\pixie-atomic.h" />
     <ClInclude Include="..\src\pixie-nic.h" />
+    <ClInclude Include="..\src\pixie-sockets.h" />
+    <ClInclude Include="..\src\pixie-threads.h" />
+    <ClInclude Include="..\src\pixie-timer.h" />
     <ClInclude Include="..\src\pixie.h" />
     <ClInclude Include="..\src\proto-dns-compressor.h" />
     <ClInclude Include="..\src\proto-dns-formatter.h" />
@@ -100,7 +138,10 @@
     <ClInclude Include="..\src\rawsock.h" />
     <ClInclude Include="..\src\resolver.h" />
     <ClInclude Include="..\src\robdns.h" />
+    <ClInclude Include="..\src\rte-ring.h" />
     <ClInclude Include="..\src\selftest.h" />
+    <ClInclude Include="..\src\smack.h" />
+    <ClInclude Include="..\src\smackqueue.h" />
     <ClInclude Include="..\src\source.h" />
     <ClInclude Include="..\src\string_s.h" />
     <ClInclude Include="..\src\success-failure.h" />
@@ -110,6 +151,8 @@
     <ClInclude Include="..\src\util-filename.h" />
     <ClInclude Include="..\src\util-ipaddr.h" />
     <ClInclude Include="..\src\util-keyword.h" />
+    <ClInclude Include="..\src\util-realloc2.h" />
+    <ClInclude Include="..\src\zonefile-insertion.h" />
     <ClInclude Include="..\src\zonefile-dfa.h" />
     <ClInclude Include="..\src\zonefile-fields.h" />
     <ClInclude Include="..\src\zonefile-load.h" />
@@ -119,8 +162,10 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\example.zone" />
+    <None Include="..\examples\master.conf" />
     <None Include="..\Makefile" />
     <None Include="..\README.md" />
+    <None Include="..\src\examples\keys.conf" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{C41F4EA3-3D4E-41B1-BB5D-5E5ED191F32B}</ProjectGuid>
@@ -168,6 +213,9 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <LinkIncremental>true</LinkIncremental>
+    <OutDir>..\bin\</OutDir>
+    <IntDir>..\tmp\$(Configuration)\</IntDir>
+    <RunCodeAnalysis>true</RunCodeAnalysis>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
@@ -191,6 +239,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <EnablePREfast>false</EnablePREfast>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>

@@ -3,6 +3,8 @@
 #include "db-rrset.h"
 #include "zonefile-rr.h"
 #include "domainname.h"
+#include "pixie-threads.h"
+#include "util-realloc2.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,22 +22,40 @@ struct DBZone
     struct DomainPointer domain;
     unsigned label_count;
 
+    /* optimizes wildcard searches */
     struct {
         unsigned shortest;
         unsigned longest;
     } wildcard;
+
+    /* optimize delegation searches */
     struct {
         unsigned shortest;
         unsigned longest;
     } delegation;
 
+    /* The master hash table */
     unsigned entry_count;
     unsigned entry_mask;
     struct DBEntry **records;
+
+    /** Tracks the timestamp/size of the file(s) that contains all the zone
+     * data in order to detect when any files have changed */
+    struct Conf_TrackFile *file_tracker;
+
     unsigned char domain_buffer[256];
 };
 
 
+uint64_t zone_hash(const struct DBZone *zone)
+{
+    return zone->hash;
+}
+
+struct DBZone *zone_next(struct DBZone *zone)
+{
+    return zone->next;
+}
 
 /****************************************************************************
  ****************************************************************************/
@@ -126,7 +146,7 @@ zone_lookup_wildcard(const struct DBZone *zone, const struct DB_XDomain *xdomain
     wdomain.label_count = xdomain->label_count;
     memcpy(wdomain.labels, xdomain->labels, sizeof(wdomain.labels[0])*wdomain.label_count);
 
-    for (i=zone->wildcard.longest; i>=zone->wildcard.shortest; i--) {
+    for (i=zone->wildcard.longest+1; i>=zone->wildcard.shortest; i--) {
         uint64_t hash;
         const struct DBEntry *record;
 
@@ -264,8 +284,10 @@ zone_get_soa_rr(const struct DBZone *zone)
 
 
 /****************************************************************************
+ * nearest power of 2 greater than the given number
  ****************************************************************************/
-uint64_t pow2(uint64_t x)
+static uint64_t 
+pow2(uint64_t x)
 {
     uint64_t result = 1;
 
@@ -275,19 +297,42 @@ uint64_t pow2(uint64_t x)
     return result;
 }
 
+
+void
+zone_insert_self(struct DBZone *zone, volatile struct DBZone **location)
+{
+    for (;;) {
+        zone->next = (struct DBZone *)*location;
+    
+#if SIZE_MAX == 0xffffffff
+        /* 32-bit architectures */
+        if (!pixie_locked_CAS32(location, (unsigned)zone, (unsigned)zone->next))
+            printf("\nlock err %u %u\n", (unsigned)*location, (unsigned)zone);
+        else
+            break;
+#else
+        /* 64-bit architectures */
+        if (!pixie_locked_CAS64(location, (size_t)zone, (size_t)zone->next))
+            printf("\nerr %llu %llu\n", (unsigned long long)*location, (unsigned long long)zone); /* fixme */
+        else
+            break;
+#endif
+    }
+}
+
 /****************************************************************************
  ****************************************************************************/
 struct DBZone *
 zone_create_self(
     const struct DB_XDomain *xdomain,
-    struct DBZone *next,
-    uint64_t filesize)
+    uint64_t filesize,
+    const char *filename)
 {
 	struct DBZone *zone;
 	uint64_t hash = xdomain->hash;
 
 	/* Fill in the zone */
-    zone = (struct DBZone*)malloc(sizeof(*zone));
+    zone = REALLOC2(0, 1, sizeof(*zone));
     memset(zone, 0, sizeof(*zone));
     zone->hash = hash;
     zone->domain.name = zone->domain_buffer;
@@ -299,18 +344,16 @@ zone_create_self(
 
     /* Allocate space for records */
     zone->entry_count = (unsigned)pow2(filesize/64);
-    //fprintf(stderr, "%u zone entry count\n", zone->entry_count);
-    xdomain_err(xdomain, ": initial entries %u\n", zone->entry_count);
+    
+    
     zone->entry_mask = zone->entry_count - 1;
-    zone->records = (struct DBEntry **)malloc(zone->entry_count * sizeof(zone->records[0]));
+    zone->records = REALLOC2(0, zone->entry_count, sizeof(zone->records[0]));
     if (zone->records == NULL) {
         xdomain_err(xdomain, ": allocation failed\n");
         exit(1);
     }
     memset(zone->records, 0, zone->entry_count * sizeof(zone->records[0]));
     
-    /* Insert into our hash table */
-    zone->next = next;
     zone->label_count = domain_count_labels(&zone->domain);
 
     return zone;

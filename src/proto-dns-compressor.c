@@ -4,21 +4,32 @@
 #include "resolver.h"
 #include "packet.h"
 #include "string_s.h"
+#include "util-realloc2.h"
 #include <string.h>
 
 
-/****************************************************************************
- ****************************************************************************/
+/******************************************************************************
+ * Tests if two labels are the same.
+ *
+ * Note: don't use a generic function here. This has very narrow requirements
+ * just for labels in this narrow case. Namely, it's doing a case-insensitive
+ * compare. As defined by the RFC (FIXME: reference needed), when compressing
+ * names, it can be done so in a case insensitive manner.
+ ******************************************************************************/
 static int
 is_equal(const unsigned char *lhs, const unsigned char *rhs)
 {
-    if (lhs[0] != rhs[0])
+    size_t lhs_len = lhs[0];
+    size_t rhs_len = rhs[0];
+    
+    if (lhs_len != rhs_len)
         return 0;
-    return memcasecmp(lhs+1, rhs+1, lhs[0]) == 0;
+    
+    return strncasecmp((char*)lhs+1, (char*)rhs+1, lhs_len) == 0;
 }
 
-/****************************************************************************
- ****************************************************************************/
+/******************************************************************************
+ ******************************************************************************/
 static unsigned short
 compressor_new(struct Compressor *compressor, const unsigned char *label)
 {
@@ -30,12 +41,12 @@ compressor_new(struct Compressor *compressor, const unsigned char *label)
 }
 
 
-/****************************************************************************
- ****************************************************************************/
+/******************************************************************************
+ ******************************************************************************/
 static unsigned
-compressor_init_label(struct Compressor *compressor, unsigned id_index, const unsigned char *label)
+compressor_init_label(struct Compressor *compressor, 
+                      unsigned id_index, const unsigned char *label)
 {
-    //static const unsigned ID_MAX = sizeof(compressor->ids)/sizeof(compressor->ids[0]);
     struct CompressorId *parent = &compressor->ids[id_index];
     unsigned child_index;
 
@@ -62,12 +73,12 @@ compressor_init_label(struct Compressor *compressor, unsigned id_index, const un
 }
 
 
-/****************************************************************************
- ****************************************************************************/
+/******************************************************************************
+ ******************************************************************************/
 static unsigned
-compressor_init_partialname(struct Compressor *compressor, struct DomainPointer domain, unsigned id_index)
+compressor_init_partialname(struct Compressor *compressor, 
+                            struct DomainPointer domain, unsigned id_index)
 {
-    //static const unsigned ID_MAX = sizeof(compressor->ids)/sizeof(compressor->ids[0]);
     unsigned char label_offsets[128];
     unsigned i;
     unsigned n;
@@ -86,12 +97,16 @@ compressor_init_partialname(struct Compressor *compressor, struct DomainPointer 
     
     /* traverse the tree trying to match existing items */
     while (i) {
-        id_index = compressor_init_label(compressor, id_index, &name[label_offsets[i-1]]);
+        id_index = compressor_init_label(compressor, 
+                                         id_index, 
+                                         &name[label_offsets[i-1]]);
         i--;
     }
     return id_index;
 }
 
+/******************************************************************************
+ ******************************************************************************/
 static unsigned
 compressor_append_partialname(
     struct Compressor *compressor, 
@@ -100,7 +115,6 @@ compressor_append_partialname(
     unsigned id_index,
     unsigned prefix_length)
 {
-    //static const unsigned ID_MAX = sizeof(compressor->ids)/sizeof(compressor->ids[0]);
     unsigned char label_offsets[128];
     unsigned i;
     unsigned n;
@@ -123,7 +137,9 @@ compressor_append_partialname(
     uncompressed_length = name_length;
     while (i) {
         unsigned packet_offset;
-        id_index = compressor_init_label(compressor, id_index, &name[label_offsets[i-1]]);
+        id_index = compressor_init_label(compressor, 
+                                         id_index, 
+                                         &name[label_offsets[i-1]]);
         packet_offset = compressor->ids[id_index].compression_code;
 
         if (packet_offset == 0) {
@@ -138,11 +154,17 @@ compressor_append_partialname(
 
     /* record the remaining offsets */
     while (i) {
-        compressor->ids[id_index].compression_code = (unsigned short)(pkt->offset + label_offsets[i-1] + prefix_length - compressor->offset_start);
+        compressor->ids[id_index].compression_code = (unsigned short)(
+                                        pkt->offset 
+                                        + label_offsets[i-1] 
+                                        + prefix_length 
+                                        - compressor->offset_start);
         i--;
         if (i == 0)
             break;
-        id_index = compressor_init_label(compressor, id_index, &name[label_offsets[i-1]]);
+        id_index = compressor_init_label(compressor, 
+                                         id_index, 
+                                         &name[label_offsets[i-1]]);
     }
 
     /* Write the uncompressed portions of the name, if there are any */
@@ -161,7 +183,7 @@ compressor_append_partialname(
     /* write the trailing compression code, if there is one */
     if (compression_code) {
         if (pkt->offset+2 < pkt->max) {
-            pkt->buf[pkt->offset+0] = (unsigned char)(0xC0 | compression_code>>8);
+            pkt->buf[pkt->offset+0] = (unsigned char)(0xC0|compression_code>>8);
             pkt->buf[pkt->offset+1] = (unsigned char)(compression_code);
         }
         pkt->offset += 2;
@@ -170,29 +192,38 @@ compressor_append_partialname(
     return id_index;
 }
 
-/****************************************************************************
- ****************************************************************************/
+/******************************************************************************
+ ******************************************************************************/
 static void
-compressor_init_fullname(struct Compressor *compressor, struct DomainPointer name, struct DomainPointer origin)
+compressor_init_fullname(struct Compressor *compressor, 
+                         struct DomainPointer name, struct DomainPointer origin)
 {
     unsigned id_index;
 
     id_index = compressor_init_partialname(compressor, origin, 0);
     id_index = compressor_init_partialname(compressor, name, id_index);
 }
+
+
+/******************************************************************************
+ ******************************************************************************/
 void
-compressor_append_name(struct Compressor *compressor, struct Packet *pkt, struct DomainPointer name, struct DomainPointer origin)
+compressor_append_name(struct Compressor *compressor, 
+                       struct Packet *pkt, 
+                       struct DomainPointer name, struct DomainPointer origin)
 {
     unsigned id_index;
 
-    id_index = compressor_append_partialname(compressor, pkt, origin, 0,        name.length);
+    id_index = compressor_append_partialname(compressor, pkt, 
+                                             origin, 0, name.length);
     if (name.length)
-        id_index = compressor_append_partialname(compressor, pkt, name,   id_index, 0          );
+        id_index = compressor_append_partialname(compressor, pkt, 
+                                                 name, id_index, 0);
 }
 
 
-/****************************************************************************
- ****************************************************************************/
+/******************************************************************************
+ ******************************************************************************/
 void
 compressor_init(struct Compressor *compressor, 
                 const struct DNS_OutgoingResponse *response, 
@@ -210,17 +241,19 @@ compressor_init(struct Compressor *compressor,
 
     rrcount = response->ancount + response->nscount + response->arcount;
     for (i=0; i<rrcount; i++) {
-        compressor_init_fullname(compressor, response->rrsets[i].name, response->rrsets[i].origin);
+        compressor_init_fullname(compressor, 
+                                 response->rrsets[i].name, 
+                                 response->rrsets[i].origin);
     }
 }
 
 
-/****************************************************************************
- ****************************************************************************/
+/******************************************************************************
+ ******************************************************************************/
 int
 compressor_selftest(const struct DNS_OutgoingResponse *response)
 {
-    unsigned char buf[65536];
+    unsigned char *buf = REALLOC2(NULL, 65536, 1);
     struct Packet pkt;
     struct Compressor compressor[1];
     unsigned i;

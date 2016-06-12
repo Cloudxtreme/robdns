@@ -287,12 +287,12 @@ int pcapfile_readframe(
 	/* Read in the 16-byte frame header. */
 	bytes_read = fread(header, 1, 16, capfile->fp);
 	if (bytes_read < 16) {
-		if (bytes_read < 0) {
-			fprintf(stderr, "%s: failed to read header\n", capfile->filename);
-			perror(capfile->filename);
-		} else if (bytes_read == 0)
-			; /* normal end-of-file */
-		else
+        if (bytes_read == 0) {
+            if (ferror(capfile->fp)) {
+                fprintf(stderr, "%s: failed to read header\n", capfile->filename);
+                perror(capfile->filename);
+            }
+		} else
 			fprintf(stderr, "%s: premature end-of-file\n", capfile->filename);
 		return 0;
 	}
@@ -375,7 +375,7 @@ int pcapfile_readframe(
 
 		/* If we reach the end without finding a good frame, then stop */
 		if (bytes_read == 0) {
-			if (bytes_read < 0) {
+			if (ferror(capfile->fp)) {
 				fprintf(stderr, "%s: error at end of file\n", capfile->filename);
 				perror(capfile->filename);
 			} else
@@ -491,7 +491,7 @@ int pcapfile_readframe(
 	 */
 	bytes_read = fread(buf, 1, *r_captured_length, capfile->fp);
 	if (bytes_read < *r_captured_length) {
-		if (bytes_read < 0) {
+		if (ferror(capfile->fp)) {
 			fprintf(stderr, "%s: could not read packet data, frame #%" PRId64 "\n", 
                 capfile->filename, capfile->frame_number);
 			perror(capfile->filename);
@@ -558,7 +558,7 @@ struct PcapFile *pcapfile_openread(const char *capfilename)
 	 */
 	bytes_read = fread(buf, 1, 24, fp);
 	if (bytes_read < 24) {
-		if (bytes_read < 0) {
+		if (ferror(fp)) {
 			fprintf(stderr, "%s: could not read PCAP header\n", capfilename);
 			perror(capfilename);
 		} else if (bytes_read == 0)
@@ -613,7 +613,6 @@ struct PcapFile *pcapfile_openread(const char *capfilename)
 	/* Read the first frame's timestamp */
 	{
 		int loc;
-		char buf[8];
         size_t xx;
 
 		loc = ftell(fp);
@@ -646,6 +645,8 @@ struct PcapFile *pcapfile_openread(const char *capfilename)
 	{
 		struct PcapFile *capfile = 0;
 		capfile = (struct PcapFile*)malloc(sizeof(*capfile));
+        if (capfile == NULL)
+            exit(1);
 		memset(capfile,0,sizeof(*capfile));
 		capfile->byte_order = byte_order;
 
@@ -698,6 +699,8 @@ struct PcapFile *pcapfile_openwrite(const char *capfilename, unsigned linktype)
 	{
 		struct PcapFile *capfile = 0;
 		capfile = (struct PcapFile*)malloc(sizeof(*capfile));
+        if (capfile == NULL)
+            exit(1);
 		memset(capfile,0,sizeof(*capfile));
 		
 		if (strlen(capfilename)+1 < sizeof(capfile->filename)) {
@@ -825,6 +828,8 @@ struct PcapFile *pcapfile_openappend(const char *capfilename, unsigned linktype)
 	{
 
 		capfile = (struct PcapFile*)malloc(sizeof(*capfile));
+        if (capfile == NULL)
+            exit(1);
 		memset(capfile,0,sizeof(*capfile));
 		capfile->byte_order = byte_order;
 		if (strlen(capfilename)+1 < sizeof(capfile->filename)) {
@@ -871,6 +876,8 @@ void pcapfile_writeframe(
 
 	if (capfile == NULL || capfile->fp == NULL)
 		return;
+    if (buffer == NULL)
+        return;
 
 	/*
 	 * Write timestamp
@@ -925,6 +932,7 @@ void pcapfile_writeframe(
 		perror(capfile->filename);
 		fclose(capfile->fp);
 		capfile->fp = NULL;
+        return;
 	}
 
 	if (fwrite(buffer, 1, buffer_size, capfile->fp) != buffer_size) {
@@ -933,6 +941,7 @@ void pcapfile_writeframe(
 		perror(capfile->filename);
 		fclose(capfile->fp);
 		capfile->fp = NULL;
+        return;
 	}
 }
 

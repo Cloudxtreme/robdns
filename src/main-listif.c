@@ -3,6 +3,8 @@
 #include "adapter-pcaplive.h"
 #include "unusedparm.h"
 #include "string_s.h"
+#include "pixie-sockets.h"
+#include "util-realloc2.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <time.h>
@@ -11,8 +13,6 @@
 #include <stdlib.h>
 
 #ifdef WIN32
-#include <WinSock2.h>
-#include <WS2tcpip.h>
 #if defined(_MSC_VER)
 #pragma comment(lib, "iphlpapi.lib")
 #include <ws2ipdef.h>
@@ -21,7 +21,7 @@
 #include <iphlpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h> 
@@ -33,29 +33,27 @@
 
 int win32_list_interfaces()
 {
-
 // Declare and initialize variables
     PIP_INTERFACE_INFO pInfo = NULL;
-    ULONG ulOutBufLen = 0;
+    DWORD ulOutBufLen = 0;
 
     DWORD dwRetVal = 0;
     int iReturn = 1;
 
     int i;
 
-// Make an initial call to GetInterfaceInfo to get
-// the necessary size in the ulOutBufLen variable
+    // Make an initial call to GetInterfaceInfo to get
+    // the necessary size in the ulOutBufLen variable
     dwRetVal = GetInterfaceInfo(NULL, &ulOutBufLen);
-    if (dwRetVal == ERROR_INSUFFICIENT_BUFFER) {
-        pInfo = (IP_INTERFACE_INFO *) malloc(ulOutBufLen);
-        if (pInfo == NULL) {
-            printf
-                ("Unable to allocate memory needed to call GetInterfaceInfo\n");
-            return 1;
-        }
+    if (dwRetVal != ERROR_INSUFFICIENT_BUFFER) {
+        fprintf(stderr, "listif: unexpected condition\n");
+        return 1;
     }
-// Make a second call to GetInterfaceInfo to get
-// the actual data we need
+
+    pInfo = MALLOC2(ulOutBufLen);
+
+    // Make a second call to GetInterfaceInfo to get
+    // the actual data we need
     dwRetVal = GetInterfaceInfo(pInfo, &ulOutBufLen);
     if (dwRetVal == NO_ERROR) {
         printf("Number of Adapters: %ld\n\n", pInfo->NumAdapters);
@@ -71,7 +69,7 @@ int win32_list_interfaces()
             ("There are no network adapters with IPv4 enabled on the local system\n");
         iReturn = 0;
     } else {
-        printf("GetInterfaceInfo failed with error: %d\n", dwRetVal);
+        printf("GetInterfaceInfo failed with error: %u\n", (unsigned)dwRetVal);
         iReturn = 1;
     }
 
@@ -97,26 +95,18 @@ int win32_list_adapters()
     UINT i;
     ULONG ulOutBufLen = sizeof (IP_ADAPTER_INFO);
 
-    pAdapterInfo = (IP_ADAPTER_INFO *) malloc(sizeof (IP_ADAPTER_INFO));
-    if (pAdapterInfo == NULL) {
-        printf("Error allocating memory needed to call GetAdaptersinfo\n");
-        return 1;
-    }
+    pAdapterInfo = (IP_ADAPTER_INFO *) MALLOC2(sizeof (IP_ADAPTER_INFO));
 // Make an initial call to GetAdaptersInfo to get
 // the necessary size into the ulOutBufLen variable
     if (GetAdaptersInfo(pAdapterInfo, &ulOutBufLen) == ERROR_BUFFER_OVERFLOW) {
         free(pAdapterInfo);
-        pAdapterInfo = (IP_ADAPTER_INFO *) malloc(ulOutBufLen);
-        if (pAdapterInfo == NULL) {
-            printf("Error allocating memory needed to call GetAdaptersinfo\n");
-            return 1;
-        }
+        pAdapterInfo = (IP_ADAPTER_INFO *) MALLOC2(ulOutBufLen);
     }
 
     if ((dwRetVal = GetAdaptersInfo(pAdapterInfo, &ulOutBufLen)) == NO_ERROR) {
         pAdapter = pAdapterInfo;
         while (pAdapter) {
-            printf("\tComboIndex: \t%d\n", pAdapter->ComboIndex);
+            printf("\tComboIndex: \t%u\n", (unsigned)pAdapter->ComboIndex);
             printf("\tAdapter Name: \t%s\n", pAdapter->AdapterName);
             printf("\tAdapter Desc: \t%s\n", pAdapter->Description);
             printf("\tAdapter Addr: \t");
@@ -126,7 +116,7 @@ int win32_list_adapters()
                 else
                     printf("%.2X-", (int) pAdapter->Address[i]);
             }
-            printf("\tIndex: \t%d\n", pAdapter->Index);
+            printf("\tIndex: \t%u\n", (unsigned)pAdapter->Index);
             printf("\tType: \t");
             switch (pAdapter->Type) {
             case MIB_IF_TYPE_OTHER:
@@ -151,7 +141,7 @@ int win32_list_adapters()
                 printf("Slip\n");
                 break;
             default:
-                printf("Unknown type %ld\n", pAdapter->Type);
+                printf("Unknown type %u\n", (unsigned)pAdapter->Type);
                 break;
             }
 
@@ -166,7 +156,7 @@ int win32_list_adapters()
             pAdapter = pAdapter->Next;
         }
     } else {
-        printf("GetAdaptersInfo failed with error: %d\n", dwRetVal);
+        printf("GetAdaptersInfo failed with error: %u\n", (unsigned)dwRetVal);
 
     }
     if (pAdapterInfo)
@@ -327,11 +317,11 @@ name_to_guid(const char *in_name)
     for (i=0; i<8; i++) {
         if (*name == '-')
             name++;
-        if (isxdigit(*name)) {
+        if (isxdigit(name[0]&0xFF)) {
             result.Data4[i] = hexval(*name)<<4;
             name++;
         }
-        if (isxdigit(*name)) {
+        if (isxdigit(name[0]&0xFF)) {
             unsigned char x = hexval(*name);
             result.Data4[i] |= x;
             name++;
@@ -435,10 +425,10 @@ int listif(int argc, char *argv[])
                 {
                     struct sockaddr_in *sin = (struct sockaddr_in*)address->addr;
 				    printf("%u.%u.%u.%u  ",
-                        (sin->sin_addr.s_addr>> 0)&0xFF,
-                        (sin->sin_addr.s_addr>> 8)&0xFF,
-                        (sin->sin_addr.s_addr>>16)&0xFF,
-                        (sin->sin_addr.s_addr>>24)&0xFF
+                        (unsigned char)(sin->sin_addr.s_addr>> 0)&0xFF,
+                        (unsigned char)(sin->sin_addr.s_addr>> 8)&0xFF,
+                        (unsigned char)(sin->sin_addr.s_addr>>16)&0xFF,
+                        (unsigned char)(sin->sin_addr.s_addr>>24)&0xFF
 				    );
                 }
 				break;
@@ -448,12 +438,12 @@ int listif(int argc, char *argv[])
                     unsigned char *px = (unsigned char*)&sin6->sin6_addr;
                     unsigned j;
                     for (j=0; j<8; j++) {
-                        unsigned short x = px[0]<<8 | px[1];
+                        unsigned xx = px[0]<<8 | px[1];
 
-                        if (j==0 && x == 0xfe80)
+                        if (j==0 && xx == 0xfe80)
                             break;
                         px += 2;
-                        printf("%x%s", x, (j==7)?"  ":":");
+                        printf("%x%s", xx, (j==7)?"  ":":");
                     }
                 }
 				break;

@@ -1,4 +1,7 @@
 #include "main-conf.h"
+#include "db.h"
+#include "conf-trackfile.h"
+#include "configuration.h"
 #include "string_s.h"
 #include "logger.h"
 #include "util-ipaddr.h"
@@ -7,94 +10,369 @@
 #include "success-failure.h"
 #include "pixie.h"
 #include "pixie-nic.h"
+#include "pixie-timer.h"
+#include "pixie-threads.h"
+#include "util-realloc2.h"
 #include <ctype.h>
 #include <limits.h>
 #include <stdint.h>
-
+#include <sys/stat.h>
 
 /****************************************************************************
  * This function parses the zone-file. Since parsing can take a long time,
  * such as when reading the .com file, we print status indicating how long
  * things are taking.
  ****************************************************************************/
-static enum Status
-parse_zone_file(struct Catalog *db, const char *filename)
+enum SuccessFailure
+zonefile_benchmark(
+        struct DomainPointer domain,
+        struct DomainPointer origin,
+	    unsigned type,
+        unsigned ttl,
+        unsigned rdlength,
+        const unsigned char *rdata,
+        uint64_t filesize,
+	    void *userdata,
+        const char *filename,
+        unsigned line_number)
 {
+    return Success;
+}
+
+/****************************************************************************
+ * Look for suffixes to strings, especially looking for file types like
+ * ".conf" or ".zone" or ".pcap".
+ * @return 1 if the string has that suffix, or 0 otherwise.
+ ****************************************************************************/
+static int
+ends_with(const char *string, const char *suffix)
+{
+    size_t string_length = strlen(string);
+    size_t suffix_length = strlen(suffix);
+
+    if (suffix_length > string_length)
+        return 0;
+
+    return memcmp(string+string_length-suffix_length, suffix, suffix_length) == 0;
+}
+
+/****************************************************************************
+ ****************************************************************************/
+static char *
+combine_filename(const char *dirname, const char *filename)
+{
+    size_t dirname_len = strlen(dirname);
+    size_t filename_len = strlen(filename);
+    char *xfilename = REALLOC2(0, 1, dirname_len + filename_len + 2);
+
+    memcpy(xfilename, dirname, dirname_len);
+
+    while (dirname_len && (xfilename[dirname_len-1] == '/' || xfilename[dirname_len-1] == '\\'))
+        dirname_len--;
+
+    xfilename[dirname_len++] = '/';
+    memcpy(xfilename + dirname_len, filename, filename_len);
+    xfilename[dirname_len + filename_len] = '\0';
+
+    return xfilename;
+}
+
+
+
+
+
+/****************************************************************************
+ ****************************************************************************/
+struct XParseThread {
+    struct Catalog *db_load;
+    size_t start_index;
+    size_t end_index;
+    enum SuccessFailure status;
+    size_t thread_handle;
+    uint64_t total_bytes;
+    uint64_t total_files;
+    struct Configuration *cfg;
+};
+
+/****************************************************************************
+ ****************************************************************************/
+static void
+conf_zonefiles_parse_thread(void *v)
+{
+    struct XParseThread *p = (struct XParseThread *)v;
+    struct Catalog *db = p->db_load;
+    struct Configuration *cfg = p->cfg;
     struct ZoneFileParser *parser;
-    FILE *fp;
-    int err;
-    uint64_t filesize;
-    uint64_t total_read = 0;
     static const struct DomainPointer root = {(const unsigned char*)"\0",1};
+    size_t directory_index;
+    size_t file_index;
+    size_t current_index;
 
+    fflush(stderr);
+    fflush(stdout);
 
-
-    /*
-     * Open the file
-     */
-    err = fopen_s(&fp, filename, "rb");
-    if (err || fp == NULL) {
-        perror(filename);
-        return Failure;
-    }
-
-    /*
-     * Get the size of the file
-     * TODO: there is a TOCTOU race condition here
-     */
-    filesize = pixie_get_filesize(filename);
-    if (filesize == 0) {
-        LOG(0, "%s: file is empty\n", filename);
-        fclose(fp);
-        return Failure;
-    }
 
     /*
      * Start the parsing
      */
-    parser = zonefile_begin(root, 60, filesize,             
-            filename, 
-            zonefile_load, 
-            db
-            );
+    parser = zonefile_begin(
+                root, 
+                60, 128,
+                cfg->options.directory,
+                zonefile_load, 
+                db,
+                cfg->insertion_threads
+                );
 
     /*
-     * Continue parsing the file until end, reporting progress as we
-     * go along
+     * Find the starting point. This converts the single
+     * integer number into a [directory, file] index pair.
      */
-    for (;;) {
-        unsigned char buf[65536];
-        size_t bytes_read;
-
-        bytes_read = fread((char*)buf, 1, sizeof(buf), fp);
-        if (bytes_read == 0)
+    current_index = 0;
+    for (directory_index = 0; directory_index < cfg->zonedirs_length; directory_index++) {
+        struct Cfg_ZoneDir *zonedir = cfg->zonedirs[directory_index];
+        current_index += zonedir->file_count;
+        if (current_index >= p->start_index)
             break;
+    }
+    file_index = current_index - p->start_index;
 
-        zonefile_parse(
-            parser,
-            buf,
-            bytes_read
-            );
 
-        total_read += bytes_read;
-        if ((total_read & 0x3FFFFF) == 0) {
-            double percent_done = total_read*100.0/filesize;
-            fprintf(stderr, "%2.1f%% done, %12llu mbytes read\r", percent_done, total_read/(1024ULL*1024ULL));
+    
+    /*
+     * 'for all zonefiles in this directory...'
+     */
+    if (directory_index < cfg->zonedirs_length)
+    while (current_index < p->end_index) {
+        const char *filename;
+        FILE *fp;
+        int err;
+        uint64_t filesize;
+        struct Cfg_ZoneDir *zonedir;
+        
+        /* If we've gone past the end of this directory,
+         * then start parsing the next directory */
+        zonedir = cfg->zonedirs[directory_index];
+        if (file_index >= zonedir->file_count) {
+            file_index = 0;
+            directory_index++;
+            if (directory_index >= cfg->zonedirs_length)
+                break;
+            zonedir = cfg->zonedirs[directory_index];
         }
+
+        filename = zonedir->files[file_index].filename;
+        filesize = zonedir->files[file_index].size;
+        current_index++;
+        file_index++;
+
+        /*
+         * Open the file
+         */
+        fflush(stdout);
+        fflush(stderr);
+        err = fopen_s(&fp, filename, "rb");
+        if (err || fp == NULL) {
+            perror(filename);
+            p->status = Failure;
+            return;
+        }
+        p->total_bytes += filesize;
+
+        /*
+         * Set parameters
+         */
+        zonefile_begin_again(
+            parser,
+            root,   /* . domain origin */
+            60,     /* one minute ttl */
+            filesize, 
+            filename);
+
+        /*
+         * Continue parsing the file until end, reporting progress as we
+         * go along
+         */
+        for (;;) {
+            unsigned char buf[65536];
+            size_t bytes_read;
+
+            bytes_read = fread((char*)buf, 1, sizeof(buf), fp);
+            if (bytes_read == 0)
+                break;
+
+            zonefile_parse(
+                parser,
+                buf,
+                bytes_read
+                );
+
+        }
+        fclose(fp);
     }
 
-    fclose(fp);
+    /* We are done parsing the directories. Now let's parse
+     * the individual zonefiles */
+    while (current_index < p->end_index) {
+        const char *filename;
+        FILE *fp;
+        int err;
+        uint64_t filesize;
+        struct Cfg_Zone *zone;
+        
+        if (file_index >= cfg->zones_length)
+            break;
+        zone = cfg->zones[file_index];
 
+        filename = zone->file;
+        filesize = zone->file_size;
+        current_index++;
+        file_index++;
+
+        /*
+         * Open the file
+         */
+        fflush(stdout);
+        fflush(stderr);
+        err = fopen_s(&fp, filename, "rb");
+        if (err || fp == NULL) {
+            perror(filename);
+            p->status = Failure;
+            return;
+        }
+        p->total_bytes += filesize;
+
+        /*
+         * Set parameters
+         */
+        zonefile_begin_again(
+            parser,
+            root,   /* . domain origin */
+            60,     /* one minute ttl */
+            filesize, 
+            filename);
+
+        /*
+         * Continue parsing the file until end, reporting progress as we
+         * go along
+         */
+        for (;;) {
+            unsigned char buf[65536];
+            size_t bytes_read;
+
+            bytes_read = fread((char*)buf, 1, sizeof(buf), fp);
+            if (bytes_read == 0)
+                break;
+
+            zonefile_parse(
+                parser,
+                buf,
+                bytes_read
+                );
+
+        }
+        fclose(fp);
+    }
 
     if (zonefile_end(parser) == Success) {
-        fprintf(stderr, "%s: success\n", filename);
-        return Success;
+        p->status = Success;
     } else {
-        fprintf(stderr, "%s: failure\n", filename);
-        return Failure;
+        fprintf(stderr, "%s: failure\n", "");
+        p->status = Failure;
+    }
+}
+
+/****************************************************************************
+ ****************************************************************************/
+enum SuccessFailure
+conf_zonefiles_parse(   struct Catalog *db_load,
+                        struct Configuration *cfg,
+                        uint64_t *out_total_files,
+                        uint64_t *out_total_bytes)
+{
+    struct XParseThread p[16];
+    size_t exit_code;
+    size_t parse_thread_count = 4;
+    size_t i;
+    size_t start_index;
+    enum SuccessFailure status = Success;
+    size_t in_total_files;
+
+    //LOG(2, "loading %llu zonefiles\n", conf->zonefiles.total_files);
+
+    /*
+     * Make sure we have some zonefiles to parse
+     */
+    in_total_files = cfg->zones_length + cfg->zonedirs_filecount;
+    if (in_total_files == 0)
+        return Failure; /* none found */
+
+    /* The parser threads are heavy-weight, so therefore
+     * we shouldn't have a lot of them unless we have
+     * a lot of files to parse */
+    if (in_total_files < 10)
+        parse_thread_count = 1;
+    else if (in_total_files < 5000)
+        parse_thread_count = 2;
+    else
+        parse_thread_count = 4;
+    
+
+    /*
+     * Divide the list of names into equal sized chunks,
+     * and launch a parsing thread for each one. The primary 
+     * optimization that's happening here is that that each
+     * of the threads will stall waiting for file I/O, during
+     * which time other threads can be active. Each individual
+     * file can be parsed with only a single thread, of course,
+     * because zonefiles are stateful. However, two unrelated
+     * files can be parsed at the same time.
+     */
+    start_index = 0;
+    for (i=0; i<parse_thread_count; i++) {
+        size_t end_index;
+
+        if (start_index >= in_total_files) {
+            parse_thread_count = i;
+            break;
+        }
+
+        /*
+         * Figure out the index
+         */
+        end_index = start_index + in_total_files/parse_thread_count;
+
+        p[i].db_load = db_load;
+        p[i].start_index = start_index;
+        p[i].end_index = end_index;
+        p[i].cfg = cfg;
+        p[i].total_bytes = 0;
+        p[i].total_files = 0;
+
+        if (parse_thread_count > 1) {
+            p[i].thread_handle = pixie_begin_thread(conf_zonefiles_parse_thread, 0, &p[i]);
+        } else {
+            p[i].thread_handle = 0;
+            conf_zonefiles_parse_thread(p);
+        }
+
+        start_index = end_index;
     }
 
+    /*
+     * Wait for them all to end, and collect statistics.
+     */
+    for (i=0; i<parse_thread_count; i++) {
+        pixie_join(p[i].thread_handle, &exit_code);
+        *out_total_bytes += p[i].total_bytes;
+        *out_total_files = p[i].total_files;
+        if (p[i].status != Success)
+            status = Failure;
+    }
+
+    return status;
 }
+
 
 /***************************************************************************
  ***************************************************************************/
@@ -105,45 +383,6 @@ static void conf_usage(void)
     exit(1);
 }
 
-/***************************************************************************
- * Echoes the configuration for one nic
- ***************************************************************************/
-static void
-conf_echo_nic(struct Core *conf, FILE *fp, unsigned i)
-{
-    char zzz[64];
-
-    /* If we have only one adapter, then don't print the array indexes.
-     * Otherwise, we need to print the array indexes to distinguish
-     * the NICs from each other */
-    if (conf->nic_count <= 1)
-        zzz[0] = '\0';
-    else
-        sprintf_s(zzz, sizeof(zzz), "[%u]", i);
-
-    fprintf(fp, "adapter%s = %s\n", zzz, conf->nic[i].ifname);
-    fprintf(fp, "adapter-ip%s = %u.%u.%u.%u\n", zzz,
-        (conf->nic[i].adapter_ip>>24)&0xFF,
-        (conf->nic[i].adapter_ip>>16)&0xFF,
-        (conf->nic[i].adapter_ip>> 8)&0xFF,
-        (conf->nic[i].adapter_ip>> 0)&0xFF
-        );
-    fprintf(fp, "adapter-mac%s = %02x:%02x:%02x:%02x:%02x:%02x\n", zzz,
-            conf->nic[i].adapter_mac[0],
-            conf->nic[i].adapter_mac[1],
-            conf->nic[i].adapter_mac[2],
-            conf->nic[i].adapter_mac[3],
-            conf->nic[i].adapter_mac[4],
-            conf->nic[i].adapter_mac[5]);
-    fprintf(fp, "router-mac%s = %02x:%02x:%02x:%02x:%02x:%02x\n", zzz,
-            conf->nic[i].router_mac[0],
-            conf->nic[i].router_mac[1],
-            conf->nic[i].router_mac[2],
-            conf->nic[i].router_mac[3],
-            conf->nic[i].router_mac[4],
-            conf->nic[i].router_mac[5]);
-
-}
 
 /***************************************************************************
  * Prints the current configuration to the command-line then exits.
@@ -153,8 +392,8 @@ conf_echo_nic(struct Core *conf, FILE *fp, unsigned i)
 void
 conf_echo(struct Core *conf, FILE *fp)
 {
+#if 0
     unsigned i;
-
     fprintf(fp, "# ADAPTER SETTINGS\n");
     if (conf->nic_count == 0)
         conf_echo_nic(conf, fp, 0);
@@ -162,6 +401,7 @@ conf_echo(struct Core *conf, FILE *fp)
         for (i=0; i<conf->nic_count; i++)
             conf_echo_nic(conf, fp, i);
     }
+#endif
 }
 
 
@@ -181,7 +421,7 @@ hexval(char c)
 
 /***************************************************************************
  ***************************************************************************/
-static int
+int
 parse_mac_address(const char *text, unsigned char *mac)
 {
     unsigned i;
@@ -254,16 +494,16 @@ parseTime(const char *value)
         num = num*10 + (value[0] - '0');
         value++;
     }
-    while (ispunct(value[0]) || isspace(value[0]))
+    while (ispunct(value[0]&0xFF) || isspace(value[0]&0xFF))
         value++;
 
-    if (isalpha(value[0]) && num == 0)
+    if (isalpha(value[0]&0xFF) && num == 0)
         num = 1;
 
     if (value[0] == '\0')
         return num;
 
-    switch (tolower(value[0])) {
+    switch (tolower(value[0]&0xFF)) {
     case 's':
         num *= 1;
         break;
@@ -337,7 +577,7 @@ ARRAY(const char *rhs)
  * or from the "config-file" parser for normal options.
  ***************************************************************************/
 void
-conf_set_parameter(struct Core *conf, const char *name, const char *value)
+conf_set_parameter(struct Configuration *cfg, const char *name, const char *value)
 {
     unsigned index = ARRAY(name);
     if (index >= 8) {
@@ -346,67 +586,11 @@ conf_set_parameter(struct Core *conf, const char *name, const char *value)
     }
 
     if (EQUALS("conf", name) || EQUALS("config", name)) {
-        conf_read_config_file(conf, value);
-    } else if (EQUALS("adapter", name) || EQUALS("if", name) || EQUALS("interface", name)) {
-        if (conf->nic[index].ifname[0]) {
-            fprintf(stderr, "CONF: overwriting \"adapter=%s\"\n", conf->nic[index].ifname);
-        }
-        if (conf->nic_count < index + 1)
-            conf->nic_count = index + 1;
-        sprintf_s(  conf->nic[index].ifname, 
-                    sizeof(conf->nic[index].ifname), 
-                    "%s",
-                    value);
-
-    }
-    else if (EQUALS("adapter-ip", name) || EQUALS("source-ip", name) 
-             || EQUALS("source-address", name) || EQUALS("spoof-ip", name)
-             || EQUALS("spoof-address", name)) {
-            struct ParsedIpAddress ipaddr;
-            int x;
-
-            x = parse_ip_address(value, 0, 0, &ipaddr);
-            if (!x) {
-                fprintf(stderr, "CONF: bad source IPv4 address: %s=%s\n", 
-                        name, value);
-                return;
-            }
-
-            if (ipaddr.version == 4) {
-                conf->nic[index].adapter_ip = ipaddr.address[0]<<24 | ipaddr.address[1]<<16 | ipaddr.address[2]<<8 | ipaddr.address[3];
-            } else {
-                memcpy(conf->nic[index].adapter_ipv6, ipaddr.address, 16);
-            }
-    } else if (EQUALS("adapter-port", name) || EQUALS("source-port", name)) {
-        /* Send packets FROM this port number */
-        unsigned x = strtoul(value, 0, 0);
-        if (x > 65535) {
-            fprintf(stderr, "error: %s=<n>: expected number less than 1000\n", 
-                    name);
-        } else {
-            conf->nic[index].adapter_port = x;
-        }
-    } else if (EQUALS("adapter-mac", name) || EQUALS("spoof-mac", name)
-               || EQUALS("source-mac", name)) {
-        /* Send packets FROM this MAC address */
-        unsigned char mac[6];
-
-        if (parse_mac_address(value, mac) != 0) {
-            fprintf(stderr, "CONF: bad MAC address: %s=%s\n", name, value);
-            return;
-        }
-
-        memcpy(conf->nic[index].adapter_mac, mac, 6);
-    }
-    else if (EQUALS("router-mac", name) || EQUALS("router", name)) {
-        unsigned char mac[6];
-
-        if (parse_mac_address(value, mac) != 0) {
-            fprintf(stderr, "CONF: bad MAC address: %s=%s\n", name, value);
-            return;
-        }
-
-        memcpy(conf->nic[index].router_mac, mac, 6);
+        cfg_parse_file(cfg, value);
+    } else if (EQUALS("load-threads", name) || EQUALS("load-thread", name)) {
+        cfg->loader.load_threads = (unsigned)parseInt(value);
+    } else if (EQUALS("parse-threads", name) || EQUALS("parse-thread", name)) {
+        cfg->loader.load_threads = (unsigned)parseInt(value);
     } else {
         fprintf(stderr, "CONF: unknown config option: %s=%s\n", name, value);
     }
@@ -420,30 +604,76 @@ conf_help()
     exit(1);
 }
 
-
-/****************************************************************************
- * Look for suffixes to strings, especially looking for file types like
- * ".conf" or ".zone" or ".pcap".
- * @return 1 if the string has that suffix, or 0 otherwise.
- ****************************************************************************/
+/***************************************************************************
+ * Tests if the command-line option is a directory, in which case, we
+ * need to read configuration files and zone-files from that directory
+ ***************************************************************************/
 static int
-ends_with(const char *string, const char *suffix)
+is_directory(const char *filename)
 {
-    size_t string_length = strlen(string);
-    size_t suffix_length = strlen(suffix);
+    struct stat s;
 
-    if (suffix_length > string_length)
-        return 0;
+    if (stat(filename, &s) != 0)
+        return 0; /* bad filenames not directories */
 
-    return memcmp(string+string_length-suffix_length, suffix, suffix_length) == 0;
+    return (s.st_mode & S_IFDIR) > 0;
 }
+
+
+
+
+/***************************************************************************
+ ***************************************************************************/
+static int
+has_configuration(const char *dirname)
+{
+    void *x;
+    int is_found = 0;
+
+    x = pixie_opendir(dirname);
+    if (x == NULL)
+        return 0; /* no content */
+
+    for (;;) {
+        const char *filename;
+        
+        filename = pixie_readdir(x);
+        if (filename == NULL)
+            break;
+
+        if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0)
+            continue;
+
+        if (ends_with(filename, ".zone") || ends_with(filename, ".conf")) {
+            is_found = 1;
+            break;
+        }
+
+        {
+            char *xdirname = combine_filename(dirname, filename);
+
+            if (is_directory(xdirname))
+                is_found = has_configuration(xdirname);
+
+            free(xdirname);
+
+            if (is_found)
+                break;
+        }
+    }
+
+
+    pixie_closedir(x);
+    return is_found;
+}
+
 
 /***************************************************************************
  * Read the configuration from the command-line.
  * Called by 'main()' when starting up.
  ***************************************************************************/
 void
-conf_command_line(struct Core *conf, int argc, char *argv[])
+conf_command_line(struct Configuration *cfg, int argc, char *argv[])
 {
     int i;
     struct ParsedIpAddress ipaddr;
@@ -488,7 +718,7 @@ conf_command_line(struct Core *conf, int argc, char *argv[])
                 memcpy(name2, name, name_length);
                 name2[name_length] = '\0';
 
-                conf_set_parameter(conf, name2, value);
+                conf_set_parameter(cfg, name2, value);
             }
             continue;
         }
@@ -498,85 +728,81 @@ conf_command_line(struct Core *conf, int argc, char *argv[])
             const char *arg;
 
             switch (argv[i][1]) {
+            case 'c':
+                if (argv[i][2])
+                    arg = argv[i]+2;
+                else
+                    arg = argv[++i];
+                //conf_trackfile_add(cfg->tf, argv[i]);
+                cfg_parse_file(cfg, argv[i]);
+                break;
+            case 'd':
+                if (argv[i][2])
+                    arg = argv[i]+2;
+                else
+                    arg = argv[++i];
+                if (arg[0] < '0' || '9' < arg[0])
+                    LOG_ERR(C_CONFIG, "expected numeric debug level after -d option\n");
+                else
+                    verbosity = atoi(arg);
+                break;
             case 'i':
                 if (argv[i][2])
                     arg = argv[i]+2;
                 else
                     arg = argv[++i];
-                conf_set_parameter(conf, "adapter", arg);
+                conf_set_parameter(cfg, "adapter", arg);
                 break;
             case 'h':
             case '?':
                 conf_usage();
                 break;
+            case 'v':
+                verbosity++;
+                break;
             default:
-                LOG(0, "FAIL: unknown option: -%s\n", argv[i]);
-                LOG(0, " [hint] try \"--help\"\n");
-                LOG(0, " [hint] ...or, to list nmap-compatible options, try \"--nmap\"\n");
+                LOG_ERR(C_CONFIG, "FAIL: unknown option: -%s\n", argv[i]);
+                LOG_ERR(C_CONFIG, " [hint] try \"--help\"\n");
                 exit(1);
             }
             continue;
         }
         else if (ends_with(argv[i], ".zone"))
-            parse_zone_file(conf->db, argv[i]);
-        else if (parse_ip_address(argv[i], 0, 0, &ipaddr)) {
-            conf_set_parameter(conf, "adapter-ip", argv[i]);
+            cfg_add_zonefile(cfg, argv[i]);
+        else if (ends_with(argv[i], ".conf")) {
+            //conf_trackfile_add(cfg->tf, argv[i]);
+            cfg_parse_file(cfg, argv[i]);
+        } else if (parse_ip_address(argv[i], 0, 0, &ipaddr)) {
+            ;//conf_set_parameter(conf, "adapter-ip", argv[i]);
         } else if (pixie_nic_exists(argv[i])) {
-            strcpy_s(conf->nic[0].ifname, sizeof(conf->nic[0].ifname), argv[i]);
+            //strcpy_s(conf->nic[0].ifname, sizeof(conf->nic[0].ifname), argv[i]);
+        } else if (is_directory(argv[i]) && has_configuration(argv[i])) {
+            //directory_to_zonefile_list(conf, argv[i]);
         } else {
-            LOG(0, "%s: unknown command-line parameter\n", argv[i]);
+            LOG_ERR(C_CONFIG, "%s: unknown command-line parameter\n", argv[i]);
         }
-
     }
+
 }
 
-/***************************************************************************
- * remove leading/trailing whitespace
- ***************************************************************************/
-static void
-trim(char *line)
-{
-    while (isspace(*line & 0xFF))
-        memmove(line, line+1, strlen(line));
-    while (isspace(line[strlen(line)-1] & 0xFF))
-        line[strlen(line)-1] = '\0';
-}
+
 
 /***************************************************************************
  ***************************************************************************/
-void
-conf_read_config_file(struct Core *conf, const char *filename)
+void 
+core_init(struct Core *core)
 {
-    FILE *fp;
-    errno_t err;
-    char line[65536];
+    memset(core, 0, sizeof(*core));
 
-    err = fopen_s(&fp, filename, "rt");
-    if (err) {
-        perror(filename);
-        return;
-    }
+    /*
+     * Create two databases. One database is for loading new/changed
+     * content. The other database is used by the running system, with
+     * multiple thtreads querying it. Once loaded, changes will be moved
+     * from the loading db to the running db in a thread-safe manner.
+     * (This is similar to cfg_load/cfg_run).
+     */
+    core->db_load = catalog_create();
+    core->db_run = catalog_create();
 
-    while (fgets(line, sizeof(line), fp)) {
-        char *name;
-        char *value;
-
-        trim(line);
-
-        if (ispunct(line[0] & 0xFF) || line[0] == '\0')
-            continue;
-
-        name = line;
-        value = strchr(line, '=');
-        if (value == NULL)
-            continue;
-        *value = '\0';
-        value++;
-        trim(name);
-        trim(value);
-
-        conf_set_parameter(conf, name, value);
-    }
-
-    fclose(fp);
 }
+

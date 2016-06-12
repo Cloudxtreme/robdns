@@ -22,6 +22,7 @@
 #include "proto-dns-compressor.h"
 #include "success-failure.h"
 #include "string_s.h"
+#include "util-realloc2.h"
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
@@ -74,7 +75,7 @@ struct RRSETPARSER {
     int type;
     unsigned ttl;
 };
-__inline void R_init(struct RRSETPARSER *r, const void *rrset)
+void R_init(struct RRSETPARSER *r, const void *rrset)
 {
     r->buf = (const unsigned char *)rrset;
     r->max = r->buf[0]<<8 | r->buf[1];
@@ -82,7 +83,7 @@ __inline void R_init(struct RRSETPARSER *r, const void *rrset)
     r->ttl = r->buf[4]<<24 | r->buf[5]<<16 | r->buf[6]<<8 | r->buf[7];
     r->offset = 8;
 }
-__inline void R_next_rr(struct RRSETPARSER *r, unsigned *rdlength, unsigned *rdoffset)
+void R_next_rr(struct RRSETPARSER *r, unsigned *rdlength, unsigned *rdoffset)
 {
     *rdlength = r->buf[r->offset+0]<<8 | r->buf[r->offset+1];
     *rdoffset = r->offset + 2;
@@ -90,8 +91,23 @@ __inline void R_next_rr(struct RRSETPARSER *r, unsigned *rdlength, unsigned *rdo
     r->offset = *rdoffset + *rdlength;
 }
 
-/****************************************************************************
- ****************************************************************************/
+/******************************************************************************
+ * This is the "formater" function that appends a record-set onto the end
+ * of a DNS response packet.
+ *
+ * As per DNS spec, we don't append individual records, but record-sets. In
+ * other, if two IP addresses match the DNS query name, then both should
+ * always be returned in the response, or neither.
+ *
+ * Since we have a weird internal format in the catalog/database, we need to
+ * parse that internal format while appending to the packet.
+ *
+ * For almost all records we simply blindly append the opaque contents.
+ * However, for old record types containing names, we need to do name
+ * compression when generating responses.
+ * 
+ * FIXME: this function belongs in proto-dns-formatter.c
+ ******************************************************************************/
 unsigned
 rrset_packet_append(
         const struct DBrrset *rrset,
@@ -137,6 +153,7 @@ rrset_packet_append(
         R_next_rr(r, &rdlength, &rdoffset);
 
         compressor_append_name(compressor, pkt, owner, origin);
+        
         if (pkt->offset + 10 <= max) {
             px[pkt->offset++] = (unsigned char)(r->type>>8);
             px[pkt->offset++] = (unsigned char)(r->type>>0);
@@ -148,11 +165,19 @@ rrset_packet_append(
             px[pkt->offset++] = (unsigned char)(r->ttl>> 0);
             px[pkt->offset++] = (unsigned char)(rdlength>>8);
             px[pkt->offset++] = (unsigned char)(rdlength>>0);
+        } else {
+            pkt->offset += 10;
         }
         
+        /*
+         * Just copy the opaque RDATA -- except when there are names to
+         * compress.
+         * FIXME: add more types that need compression
+         */
         switch (r->type) {
         case TYPE_NS:
         case TYPE_CNAME:
+        case TYPE_PTR:
             {
                 struct DomainPointer domain;
                 domain.name = r->buf + rdoffset;
@@ -246,6 +271,7 @@ rrset_get_glue(const struct DBZone *zone, const struct DBEntry *entry, const str
     switch (type) {
     case TYPE_NS:
     case TYPE_CNAME:
+    case TYPE_PTR:
         domain_pointer->length = GET_RDLENGTH(buf, offset);
         domain_pointer->name = buf+offset+HDR_LENGTH;
         return zone_lookup_exact2(zone, domain_pointer->name, domain_pointer->length);
@@ -447,8 +473,8 @@ entry_has_rr(
     unsigned i;
     struct RRSETPARSER R = {0};
 
-    if (type == 0x2e)
-        ;//printf(".");
+    //if (type == 0x2e)
+    //    ;//printf(".");
 
     for (i=entry->domain_length; i<entry->offset; ) {
         R_init(&R, entry->buf + i);
@@ -546,10 +572,8 @@ again:
         } else
             entry->sizeof_buf = (unsigned short)new_size;
 
-        *p_record = (struct DBEntry *)realloc(
-                            *p_record,
-                            offsetof(struct DBEntry, buf) + entry->sizeof_buf + 1
-                            );
+        *p_record = REALLOC2(*p_record, offsetof(struct DBEntry, buf) + entry->sizeof_buf + 1, 1);
+
         entry = *p_record;
         if (entry == 0) {
             fprintf(stderr, "ran out of memory\n");
@@ -661,7 +685,7 @@ entry_create_self(
     const unsigned char *rdata
     )
 {
-    unsigned char name[256];
+    unsigned char name[256+1];
     unsigned name_length;
     unsigned i;
     unsigned chain_length;
@@ -675,10 +699,11 @@ entry_create_self(
         unsigned label_length = xdomain->labels[i-1].name[0] + 1;
         memcpy(name+name_length, xdomain->labels[i-1].name, label_length);
         name_length += label_length;
-        assert(name_length < sizeof(name));
+        assert(name_length + 1 < sizeof(name));
         name[name_length] = '\0'; /*FIXME: test this for overflow */
     }
 
+//printf("." " -> %s 0x%x\n", name, xdomain->hash);
 
     /* Move forward until we get a valid entry */
     chain_length = 0;
@@ -715,11 +740,7 @@ entry_create_self(
         size_to_malloc = ALIGN(size_to_malloc, BLOCK_SIZE-1);
 
         /* Allocate space for a linked-list at this hash location */
-        entry = (struct DBEntry *)malloc(size_to_malloc+1);
-        if (entry == 0) {
-            fprintf(stderr, "ran out of memory\n");
-            exit(1);
-        }
+        entry = MALLOC2(size_to_malloc+1);
         memset(entry, 0, offsetof(struct DBEntry, buf));
 
         //entry->hash = hash;
@@ -744,8 +765,6 @@ entry_create_self(
     if (!entry_has_rr(*p_record, type, ttl, rdlength, rdata)) {
         int x;
         
-        if (type == 6)
-            printf(".");
         x = entry_add_rr(p_record, type, ttl, rdlength, rdata);
         if (x == Failure)
             print_entry(*p_record, stdout);
@@ -779,6 +798,7 @@ entry_find(
         name[name_length] = '\0'; /*FIXME: test this for overflow */
     }
 
+//printf("." "<-  %s 0x%x\n", name, xdomain->hash);
 
     /* Move forward until we get a valid entry */
     for (; entry; entry = entry->next) {

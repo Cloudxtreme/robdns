@@ -1,9 +1,11 @@
 #include "grind.h"
+#include "logger.h"
 #include "main-regression.h"
 #include "selftest.h"
 #include "adapter-pcaplive.h"
 #include "zonefile-parse.h"
 #include "rawsock.h"
+#include "configuration.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -12,20 +14,24 @@
 
 int is_verbose;
 
-//int zonefile_parser_init();
+const char *version = "robdns/0.2";
 
-
-
+/* temporary
+ * These globals are for printing debug messages. They are global for now, but
+ * I'll get rid of them eventually
+ */
 uint64_t entry_bytes;
 uint64_t entry_count;
 uint64_t total_chain_length;
 
 
+int checkconf(int argc, char *argv[]);
 int checkzone(int argc, char *argv[]);
 int listif(int argc, char *argv[]);
 int foreground(int argc, char *argv[]);
 int pcap2zone(int argc, char *argv[]);
 int selftest2(int argc, char *argv[]);
+int perftest(int argc, char *argv[]);
 
 /****************************************************************************
  ****************************************************************************/
@@ -36,10 +42,15 @@ struct {
 
     {"selftest", selftest},
     {"--selftest", selftest},
+    {"perftest", perftest},
+    {"--perftest", perftest},
     {"regress", selftest},
     {"--regress", selftest},
     {"selftest2", selftest2},
     {"checkzone", checkzone},
+    {"--checkzone", checkzone},
+    {"checkconf", checkconf},
+    {"--checkconf", checkconf},
     {"listif", listif},
     {"foreground", foreground},
     {"pcap2zone", pcap2zone},
@@ -54,13 +65,13 @@ main(int argc, char *argv[])
 {
     int i;
 
+  	LOG_INFO(C_GENERAL, "--- Rob's DNS server v0.2 ----\n");
+
     /*
-     * Once-per-process: initialize some data structures in the zone-file
-     * parsing module. 
+     * Initialize various things that are process-wide.
      */
     zonefile_parser_init();
-
-
+    cfg_parser_init();
     rawsock_init();
     
     /*
@@ -86,7 +97,7 @@ main(int argc, char *argv[])
 
 
     /*
-     * Look for a specific "command". This runs the program in a special
+     * Look for a specific "command". This runs the program in a special way
      * that focuses on a particular area. For example, the "dig" command
      * behaves a lot like the BIND9 "dig" utility, but using our paradigm.
      */
@@ -102,34 +113,15 @@ main(int argc, char *argv[])
     }
 
 
+    /*
+     * If no specific command was given, then run in the default mode as
+     * a DNS server. This runs in the 'foreground' printing to stdout/stderr,
+     * some other tool is needed to launch this as a service.
+     */
     foreground(argc, argv);
 
     return 0;
 
-#if 0
-    int i;
-    struct Grind *grind;
-    grind = grind_create();
-
-
-
-    /*
-     * Parse command-line options
-     */
-    for (i=1; i<argc; i++) {
-        if (ends_with(argv[1], ".zone")) {
-            grind_load_zonefile(grind, argv[i], ROOT, 0);
-        } else if (strcmp(argv[i], "--load") == 0 && i+1 < argc)
-            grind_load_zonefile(grind, argv[++i], ROOT, 0);
-        else if (strcmp(argv[i], "--regression") == 0 && i+1 < argc) {
-            return regression_test(argv[++i]);
-        } else {
-            fprintf(stderr, "%s: unknown command line parameter\n", argv[i]);
-        }
-    }
-
-
-#endif
 
     /*
      * Temporary: check hash efficiency
@@ -152,7 +144,6 @@ main(int argc, char *argv[])
 	grind->ip_address = 0x0a141e0f;
 	memcpy(grind->mac_address, "\x00\x11\x11\x22\x22\x22", 6);
 	
-	fprintf(stderr, "--- Rob's DNS server v1.0 ----\n");
 	fprintf(stderr, "IP: %u.%u.%u.%u\n", 
 		(unsigned char)(grind->ip_address>>24),
 		(unsigned char)(grind->ip_address>>16),

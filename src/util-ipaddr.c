@@ -39,7 +39,7 @@ hexval(int c)
  * however it can only appear once in the address.
  *
  ****************************************************************************/
-static void
+void
 format_ipv6_address(char *buf, size_t sizeof_buf, const void *v_addr)
 {
     const unsigned char *px = (const unsigned char *)v_addr;
@@ -189,11 +189,15 @@ format_address(	char *buf, size_t sizeof_buf,
 	if (sizeof_addr == 4) {
 		format_ipv4_address(buf, sizeof_buf, v_addr);
 		if (prefix_length != ~0 && prefix_length > 32)
-			prefix_length = 32;
+			prefix_length = (unsigned)~0;
+        if (prefix_length == 32)
+            prefix_length = (unsigned)~0;
 	} else if (sizeof_addr == 16) {
 		format_ipv6_address(buf, sizeof_buf, v_addr);
 		if (prefix_length != ~0 && prefix_length > 128)
-			prefix_length = 128;
+			prefix_length = (unsigned)~0;
+        if (prefix_length >= 128)
+            prefix_length = (unsigned)~0;
 	} else if (sizeof_buf > 0)
 		buf[0] = '\0';
 
@@ -234,6 +238,15 @@ format_address(	char *buf, size_t sizeof_buf,
 	}
 }
 
+void
+format_ip_address(	char *buf, size_t sizeof_buf, 
+				const void *v_addr, unsigned version, 
+				unsigned prefix_length)
+{
+    format_address(buf, sizeof_buf, v_addr, (version==4)?4:16, prefix_length);
+}
+
+
 /****************************************************************************
  * Attempts to parse an IPv4 address out of the input stream.
  * If successful, it returns 'true', moves the 'offset' forward to the next
@@ -251,7 +264,10 @@ parse_ipv4_address(const char *px, unsigned *offset, size_t length, struct Parse
     if (offset == NULL && length == 0) {
         offset = &tmp_offset;
         length = strlen(px);
+    } else if (offset == NULL) {
+        offset = &tmp_offset;
     }
+
 
     i = *offset;
 
@@ -273,7 +289,7 @@ parse_ipv4_address(const char *px, unsigned *offset, size_t length, struct Parse
             return RETURN_ERR(false);
 
         /* Parse the number */
-        for (k=0; k<3 && i+k < length && isdigit(px[i+k]); k++)
+        for (k=0; k<3 && i+k < length && isdigit(px[i+k]&0xFF); k++)
             num = num * 10 + (px[i+k]-'0');
         i += k;
         if (num > 255)
@@ -299,13 +315,13 @@ parse_ipv4_address(const char *px, unsigned *offset, size_t length, struct Parse
         
         i++;
 
-        if (i>=length || !isdigit(px[i]))
+        if (i>=length || !isdigit(px[i]*0xFF))
             return RETURN_ERR(false);
 
         n = px[i] - '0';
         i++;
 
-        if (i<length && isdigit(px[i])) {
+        if (i<length && isdigit(px[i]&0xFF)) {
             n = n * 10 + px[i] - '0';
             i++;
         }
@@ -357,7 +373,7 @@ parse_ipv6_address(const char *px, unsigned *offset, size_t length, struct Parse
 	if (i<length && px[i] == '[') {
 		is_bracket_seen = 1;
 		i++;
-		while (i<length && isspace(px[i]))
+		while (i<length && isspace(px[i]&0xFF))
 			i++;
 	}
 
@@ -385,6 +401,7 @@ parse_ipv6_address(const char *px, unsigned *offset, size_t length, struct Parse
 			if (px[i] == ':')
 				break; /* early exit due to leading nuls */
 			if (!isxdigit(px[i]&0xFF)) {
+                return RETURN_ERR(false);
 				break; /* error */
 			}
 
@@ -454,13 +471,13 @@ parse_ipv6_address(const char *px, unsigned *offset, size_t length, struct Parse
         
         i++;
 
-        if (i>=length || !isdigit(px[i]))
+        if (i>=length || !isdigit(px[i]&0xFF))
             return RETURN_ERR(false);
 
         n = px[i] - '0';
         i++;
 
-        if (i<length && isdigit(px[i])) {
+        if (i<length && isdigit(px[i]&0xFF)) {
             n = n * 10 + px[i] - '0';
             i++;
         }

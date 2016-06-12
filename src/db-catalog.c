@@ -2,12 +2,17 @@
 #include "db-zone.h"
 #include "db-xdomain.h"
 #include "zonefile-rr.h"
+#include "pixie-threads.h"
+#include "logger.h"
+#include "util-realloc2.h"
+
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <limits.h>
 
 
 
@@ -22,11 +27,62 @@ struct Catalog
 	unsigned max_labels;
 };
 
+/****************************************************************************
+ ****************************************************************************/
 unsigned
 catalog_zone_count(const struct Catalog *catalog)
 {
     return catalog->zones_created;
 }
+
+/****************************************************************************
+ * nearest power of 2 greater than the given number
+ ****************************************************************************/
+static uint64_t 
+pow2(uint64_t x)
+{
+    uint64_t result = 1;
+
+    while (result < x)
+        result *= 2;
+
+    return result;
+}
+
+/****************************************************************************
+ * When reading in a million zones, we'll need to expand the hash table.
+ * Therefore, we need to remove all the existing entries and expand
+ ****************************************************************************/
+void
+catalog_reset_zonecount(struct Catalog *db, unsigned new_count)
+{
+    struct DBZone **old_zones = db->zones;
+    size_t old_count = db->zone_count;
+    size_t i;
+
+    new_count = (unsigned)pow2(new_count);
+    db->zone_count = new_count;
+    db->zone_mask = new_count - 1;
+    db->zones = MALLOC2(sizeof(db->zones[0]) * db->zone_count);
+    if (db->zones == NULL)
+        exit(1);
+    memset(db->zones, 0, sizeof(db->zones[0]) * db->zone_count);
+
+    for (i=0; i<old_count; i++) {
+
+        while (old_zones[i]) {
+            volatile struct DBZone **location;
+            struct DBZone *zone;
+
+            zone = old_zones[i];
+            old_zones[i] = zone_next(zone);
+
+            location = (volatile struct DBZone **)&db->zones[zone_hash(zone) & db->zone_mask];
+            zone_insert_self(zone, location);
+        }
+    }
+}
+
 
 /****************************************************************************
  ****************************************************************************/
@@ -35,15 +91,13 @@ catalog_create()
 {
 	struct Catalog *db;
 
+
     /* Create object */
-	db = (struct Catalog *)malloc(sizeof(*db));
+	db = REALLOC2(0, 1, sizeof(*db));
 	memset(db, 0, sizeof(*db));
 	
     /* Create the zone table */
-    db->zone_count = 128;
-    db->zone_mask = 127;
-    db->zones = (struct DBZone **)malloc(sizeof(db->zones[0]) * db->zone_count);
-    memset(db->zones, 0, sizeof(db->zones[0]) * db->zone_count);
+    catalog_reset_zonecount(db, 128);
 
     /* Set min/max lable counts */
     db->min_labels = 128; /* impossible value: first zone entry will reduce this */
@@ -67,7 +121,7 @@ void catalog_destroy(struct Catalog *catalog)
 /****************************************************************************
  ****************************************************************************/
 struct DBZone *
-catalog_lookup_zone(struct Catalog *db, const struct DB_XDomain *xdomain)
+catalog_lookup_zone(const struct Catalog *db, const struct DB_XDomain *xdomain)
 {
 	int i;
     int min_labels;
@@ -102,7 +156,7 @@ catalog_lookup_zone(struct Catalog *db, const struct DB_XDomain *xdomain)
      * the zone
      */
 	if (zone == NULL) {
-		xdomain_err(xdomain, ": does not match any zones\n");
+		//xdomain_err(xdomain, ": does not match any zones\n");
 	}
 
 	return zone;
@@ -137,7 +191,8 @@ const struct DBZone *
 catalog_create_zone(
     struct Catalog *catalog,
     const struct DB_XDomain *domain,
-    uint64_t filesize
+    uint64_t filesize,
+    const char *filename
     )
 {
 	struct DBZone **location;
@@ -162,11 +217,15 @@ catalog_create_zone(
      * If it doesn't exist, then create it, making it the new head
      * of the linked list at this hash location.
      */
-    *location = zone_create_self(
+    zone = zone_create_self(
                         domain,
-                        *location,
-                        filesize
+                        filesize,
+                        filename
                         );
+    zone_insert_self(zone, (volatile struct DBZone **)location);
+
+    if (verbosity > 3)
+        xdomain_err(domain, ": create zone\n");
 
     if (catalog->min_labels >= domain->label_count)
         catalog->min_labels = domain->label_count;
@@ -187,11 +246,12 @@ catalog_create_zone2(
     struct Catalog *db,
 	struct DomainPointer domain,
     struct DomainPointer origin,
-    uint64_t filesize)
+    uint64_t filesize,
+    const char *filename)
 {
     struct DB_XDomain xdomain[1];
 
     xdomain_reverse3(xdomain, &domain, &origin);
 
-    return catalog_create_zone(db, xdomain, filesize);
+    return catalog_create_zone(db, xdomain, filesize, filename);
 }

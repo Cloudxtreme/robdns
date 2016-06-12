@@ -126,6 +126,7 @@ grab_dns_response(struct Catalog *catalog, const unsigned char *px, unsigned off
 
         case TYPE_NS:
         case TYPE_CNAME:
+        case TYPE_PTR:
             extract_name(   tmp_buffer, &tmp_offset, sizeof(tmp_buffer),
                             px, &src_offset, max);
             rdata = tmp_buffer;
@@ -157,7 +158,9 @@ grab_dns_response(struct Catalog *catalog, const unsigned char *px, unsigned off
             rdlength,
             rdata,
             10000,
-            catalog);
+            catalog,
+            "",
+            0);
 
         
     }
@@ -187,7 +190,6 @@ pcap2zone(int argc, char *argv[])
      * Initialize it with a pseudo-SOA record for the root zone
      */
     {
-        static const struct DomainPointer root = {(const unsigned char*)"\0",1};
     	struct ZoneFileParser *parser;
         parser = zonefile_begin(
                     root,           /* origin */
@@ -195,7 +197,8 @@ pcap2zone(int argc, char *argv[])
                     10000,          /* filesize */
                     "<pcap2zone>",  /* filename */
                     zonefile_load,  /* callback */
-                    catalog         /* callback data */
+                    catalog,        /* callback data */
+                    0
                     );
         LOAD("$TTL 60\r\n"
              "@    IN    SOA   ns hostmaster (\r\n"
@@ -249,9 +252,7 @@ pcap2zone(int argc, char *argv[])
 
             {
                 struct PreprocessedInfo info;
-                unsigned x;
 
-                
                 x = preprocess_frame(
                     buf, 
                     bytes_read,

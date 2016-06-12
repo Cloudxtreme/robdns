@@ -215,6 +215,8 @@ static unsigned null_CAN_TRANSMIT(const char *devicename)
 	return result;
 #elif defined(__linux__)
 	return 1;
+#elif defined(__APPLE__)
+    return 0;
 #endif
 }
 
@@ -293,7 +295,11 @@ void pcaplive_init()
 	pl->is_available = 0;
 	pl->is_printing_debug = 1;
 
+#if defined(__APPLE__)
+    hLibpcap = dlopen("libpcap.dylib", RTLD_LAZY);
+#else
 	hLibpcap = dlopen("libpcap.so", RTLD_LAZY);
+#endif
 	if (hLibpcap == NULL) {
 		fprintf(stderr, "%s: %s\n", "libpcap.so", dlerror());
 		fprintf(stderr, "Searching elsewhere for libpcap\n");

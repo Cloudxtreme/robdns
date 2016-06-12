@@ -4,6 +4,8 @@
 #include "zonefile-rr.h"
 #include "zonefile-fields.h"
 #include "string_s.h"
+#include "logger.h"
+#include "util-realloc2.h"
 #include <assert.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -15,6 +17,7 @@
 #include "unusedparm.h"
 
 #include "thread-atomic.h"
+#include "pixie-timer.h"
 
 
 #if defined(EVIL_KLUDGES)
@@ -32,8 +35,8 @@ static const struct {
 	const char *name;
 	unsigned value;
 } types[] = {
-{"A",		TYPE_A},	/* 1	RFC 1035[1]	address record	Returns a 32-bit IPv4 address, most commonly used to map hostnames to an IP address of the host, but also used for DNSBLs, storing subnet masks in RFC 1101, etc.*/
-{"AAAA",	TYPE_AAAA}, /* 28	RFC 3596[2]	IPv6 address record	Returns a 128-bit IPv6 address, most commonly used to map hostnames to an IP address of the host.*/
+{"A",		TYPE_A},	/*  1	RFC 1035[1]	address record	Returns a 32-bit IPv4 address, most commonly used to map hostnames to an IP address of the host, but also used for DNSBLs, storing subnet masks in RFC 1101, etc.*/
+{"AAAA",	TYPE_AAAA}, /*  28	RFC 3596[2]	IPv6 address record	Returns a 128-bit IPv6 address, most commonly used to map hostnames to an IP address of the host.*/
 {"AFSDB",	TYPE_AFSDB}, /*	18	RFC 1183	AFS database record	Location of database servers of an AFS cell. This record is commonly used by AFS clients to contact AFS cells outside their local domain. A subtype of this record is used by the obsolete DCE/DFS file system. */
 {"APL",		TYPE_APL}, /*	42	RFC 3123	Address Prefix List	Specify lists of address ranges, e.g. in CIDR format, for various address families. Experimental. */
 {"CAA",		TYPE_CAA}, /*	257	RFC 6844	Certification Authority Authorization	CA pinning, constraining acceptable CAs for a host/domain */
@@ -42,9 +45,10 @@ static const struct {
 {"DHCID",	TYPE_DHCID}, /*	49	RFC 4701	DHCP identifier	Used in conjunction with the FQDN option to DHCP */
 {"DLV",		TYPE_DLV}, /*	32769	RFC 4431	DNSSEC Lookaside Validation record	For publishing DNSSEC trust anchors outside of the DNS delegation chain. Uses the same format as the DS record. RFC 5074 describes a way of using these records. */
 {"DNAME",	TYPE_DNAME}, /*	39	RFC 2672	delegation name	DNAME creates an alias for a name and all its subnames, unlike CNAME, which aliases only the exact name in its label. Like the CNAME record, the DNS lookup will continue by retrying the lookup with the new name. */
-{"DNSKEY",	TYPE_DNSKEY}, /*	48	RFC 4034	DNS Key record	The key record used in DNSSEC. Uses the same format as the KEY record. */
+{"DNSKEY",	TYPE_DNSKEY}, /*48	RFC 4034	DNS Key record	The key record used in DNSSEC. Uses the same format as the KEY record. */
 {"DS",		TYPE_DS}, /*	43	RFC 4034	Delegation signer	The record used to identify the DNSSEC signing key of a delegated zone */
 {"HIP",		TYPE_HIP}, /*	55	RFC 5205	Host Identity Protocol	Method of separating the end-point identifier and locator roles of IP addresses. */
+{"HINFO",   TYPE_HINFO}, /* 13  RFC 1035    Host Information */
 {"IPSECKEY",TYPE_IPSECKEY}, /*	45	RFC 4025	IPsec Key	Key record that can be used with IPsec */
 {"KEY",		TYPE_KEY}, /*	25	RFC 2535[3] and RFC 2930[4]	key record	Used only for SIG(0) (RFC 2931) and TKEY (RFC 2930).[5] RFC 3445 eliminated their use for application keys and limited their use to DNSSEC.[6] RFC 3755 designates DNSKEY as the replacement within DNSSEC.[7] RFC 4025 designates IPSECKEY as the replacement for use with IPsec.[8] */
 {"KX",		TYPE_KX}, /*	36	RFC 2230	Key eXchanger record	Used with some cryptographic systems (not including DNSSEC) to identify a key management agent for the associated domain-name. Note that this has nothing to do with DNS Security. It is Informational status, rather than being on the IETF standards-track. It has always had limited deployment, but is still in use. */
@@ -69,6 +73,9 @@ static const struct {
 {"TSIG",	TYPE_TSIG}, /*	250	RFC 2845	Transaction Signature	Can be used to authenticate dynamic updates as coming from an approved client, or to authenticate responses as coming from an approved recursive name server[10] similar to DNSSEC. */
 {"TXT",		TYPE_TXT}, /* */
 
+{";",		TYPE_COMMENT}, /* */
+    
+
 {"IN",		0x10000 | CLASS_IN}, /* */
 {"CS",		0x10000 | CLASS_CS}, /* */
 {"CH",		0x10000 | CLASS_CH}, /* */
@@ -87,6 +94,7 @@ void build_type_dfa(struct MyDFA *dfa)
 
 	mydfa_init(dfa);
 
+    
 	/* first go through and add all the symbols */
 	for (i=0; types[i].name; i++) {
 		mydfa_add_symbols(dfa, (const unsigned char*)types[i].name, (unsigned)strlen(types[i].name));
@@ -96,6 +104,7 @@ void build_type_dfa(struct MyDFA *dfa)
 	for (i=0; types[i].name; i++) {
 		mydfa_add_pattern(dfa, (const unsigned char*)types[i].name, (unsigned)strlen(types[i].name), types[i].value);
 	}
+
 
 	assert(mydfa_selftest(dfa, " IN 8\n", 0x10000|CLASS_IN));
 	assert(mydfa_selftest(dfa, "IN SOA\n", 0x10000|CLASS_IN));
@@ -119,6 +128,7 @@ void build_variable_dfa(struct MyDFA *dfa)
 
 	mydfa_init(dfa);
 
+    
 	/* first go through and add all the symbols */
 	for (i=0; variables[i]; i++) {
 		mydfa_add_symbols(dfa, (const unsigned char*)variables[i], (unsigned)strlen(variables[i]));
@@ -130,6 +140,7 @@ void build_variable_dfa(struct MyDFA *dfa)
 	}
 
 	assert(mydfa_selftest(dfa, " TTL \r\t\n", 2));
+	assert(mydfa_selftest(dfa, "ORIGIN x", 1));
 
 	return;
 }
@@ -201,7 +212,10 @@ static void isdomainchar_init(void)
 /****************************************************************************
  ****************************************************************************/
 void
-x_parse_domain(struct ZoneFileParser *parser, const unsigned char *__restrict buf, unsigned *__restrict offset, unsigned length)
+x_parse_domain(struct ZoneFileParser *parser, 
+               const unsigned char *__restrict buf, 
+               unsigned *__restrict offset, 
+               unsigned length)
 {
     struct DomainBuilder *domain = &parser->rr_domain;
 	unsigned i;
@@ -532,8 +546,10 @@ int is_fqdn_terminated(struct DomainPointer domain)
 
 void mm_domain_end(struct ZoneFileParser *parser)
 {
+    struct ParsedBlock *block = parser->block;
+
     //parser->rr_domain.name[-1] = parser->rr_domain.length;
-    parser->block->offset += parser->rr_domain.length;
+    block->offset += parser->rr_domain.length;
 
     if (parser->rr_domain.is_absolute)
         return;
@@ -544,12 +560,12 @@ void mm_domain_end(struct ZoneFileParser *parser)
         /* we have a relative name, so copy the $ORIGIN */
         /* TODO: [VULN]: there should be a vuln here, we need to create
          * a test case to exercise it before fixing it */
-        memcpy( parser->block->buf + parser->block->offset,
-                parser->origin.name,
-                parser->origin.length);
-        parser->block->offset += parser->origin.length;
-        if (!is_fqdn_terminated(parser->origin)) {
-            parser->block->buf[parser->block->offset++] = '\0';
+        memcpy( block->buf + block->offset,
+                block->origin.name,
+                block->origin.length);
+        block->offset += block->origin.length;
+        if (!is_fqdn_terminated(block->origin)) {
+            block->buf[block->offset++] = '\0';
         }
     }
 }
@@ -617,6 +633,7 @@ void mm_typelist_end(struct ZoneFileParser *parser)
     UNUSEDPARM(parser);
 }
 
+
 void mm_ipv6_start(struct ZoneFileParser *parser)
 {
     parser->rr_ipv6.length = 0;
@@ -641,124 +658,7 @@ void mm_ipv6_end(struct ZoneFileParser *parser)
     parser->block->offset += 16;
 }
 
-/****************************************************************************
- ****************************************************************************/
-void
-block_process(struct ParsedBlock *block, RESOURCE_RECORD_CALLBACK callback, void *userdata, uint64_t filesize)
-{
-    unsigned i;
-    unsigned max = block->offset;
 
-    for (i=0; i<max; ) {
-        const unsigned char *buf = block->buf;
-        struct DomainPointer domain;
-        const unsigned char *rdata;
-        unsigned type;
-        unsigned ttl;
-        unsigned rdlength;
-
-        domain.length = buf[i];
-        domain.name = &buf[i+1];
-
-        i += domain.length + 1;
-
-        type = buf[i+0]<<8 | buf[i+1];
-        ttl = buf[i+2]<<24 | buf[i+3]<<16 | buf[i+4]<<8 | buf[i+5];
-        rdlength = buf[i+6]<<8 | buf[i+7];
-        i += 8;
-
-        rdata = &buf[i];
-        i += rdlength;
-
-
-        callback(
-            domain,
-            block->origin,
-            type,
-            ttl,
-            rdlength,
-            rdata,
-            filesize,
-            userdata);
-    }
-
-    block->offset = 0;
-    block->offset_start = 0;
-    block->status = BLOCK_EMPTY;
-}
-
-
-/****************************************************************************
- ****************************************************************************/
-struct ParsedBlock *
-block_next_to_insert(struct ZoneFileParser *parser)
-{
-    static const unsigned INDEX_MASK = sizeof(parser->blocks)/sizeof(parser->blocks[0]) - 1;
-    uint64_t start_index = parser->block_index + 1;
-    uint64_t stop_index = start_index + INDEX_MASK;
-    uint64_t i;
-
-    for (i=start_index; i<stop_index; i++) {
-        struct ParsedBlock *block = &parser->blocks[i & INDEX_MASK];
-        int x;
-
-        if (block->status != BLOCK_FULL)
-            continue;
-        x = thread_compare_and_swap(&parser->blocks[i&INDEX_MASK].status, BLOCK_FULL, BLOCK_INSERTING);
-        if (x)
-            return block;
-    }
-
-    return NULL;
-}
-
-/****************************************************************************
- * BLOCKS: By grouping multiple RRs together in a "block", we can have
- * multiple threads updating the zone database without having to interact
- * much with each other.
- ****************************************************************************/
-struct ParsedBlock *
-block_next_to_parse(struct ZoneFileParser *parser)
-{
-    block_process(parser->block, parser->callback, parser->callbackdata, parser->filesize);
-    return parser->block;
-#if 0
-    static const unsigned INDEX_MASK = sizeof(parser->blocks)/sizeof(parser->blocks[0]) - 1;
-    uint64_t next_index;
-    struct ParsedBlock *next_block;
-    struct ParsedBlock *prev_block = parser->block;
-
-    /* mark the current block as full */
-    parser->block->status = BLOCK_FULL;
-    printf("-");
-
-again:
-    next_index = parser->block_index + 1;
-    next_block = &parser->blocks[next_index & INDEX_MASK];
-
-    if (next_block->status != BLOCK_EMPTY) {
-        struct ParsedBlock *block;
-
-        
-        /* Oops, we are parsing the file faster than the lookup threads
-         * can keep up. Therefore, we need to stop parsing the file creaing
-         * new blocks and instead process a block ourselves */
-        block = block_next_to_insert(parser);
-        if (block)
-            block_process(block, parser->callback, parser->callbackdata, parser->filesize);
-        goto again;
-    }
-
-    /* Carry over the previous origin to the new block */
-    memcpy(next_block->origin_buffer, prev_block->origin_buffer, prev_block->origin.length);
-    next_block->origin.name = next_block->origin_buffer;
-    next_block->origin.length = prev_block->origin.length;
-
-    parser->block_index = next_index;
-    parser->block = next_block;
-    return next_block;
-#endif
-}
 
 /****************************************************************************
  ****************************************************************************/
@@ -793,36 +693,32 @@ x_parse(struct ZoneFileParser *parser, const unsigned char *buf, unsigned length
 		$RR_NSEC3, $RR_NSEC3_ALGO, $RR_NSEC3_FLAGS, $RR_NSEC3_ITERATIONS, 
 		$RR_NSEC3_SALT, $RR_NSEC3_HASH, $RR_NSEC3_TYPES,
 		$RR_NSEC, $RR_NSEC_DOMAIN, $RR_NSEC_TYPES, 
+		$RR_TLSA, $RR_TLSA_USAGE, $RR_TLSA_SELECTOR, $RR_TLSA_TYPE, $RR_TLSA_CERT,
+        $RR_SSHFP, $RR_SSHFP_ALGO, $RR_SSHFP_TYPE, $RR_SSHFP_FP,
+
+        $RR_LOC,
 		$RR_A,
 		$RR_AAAA,
 		$RR_TXT, $RR_TXT_START,
 		$RR_MX, $RR_MX_DOMAIN,
+		$RR_PTR,
 		$RR_CNAME,
 		$RR_END,
 	};
-#if 0
-    register __m128i domain_endchar;
-        domain_endchar = _mm_loadu_si128((const __m128i*)"\r\n\t\x20.\\@\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
-#endif
+
 
 	for (i=0; i<length; i++) {
 	
 	switch (s) {
 	case $RR_END:
+        /* IMPORTANT! this is the state where we've finished reading a
+         * resource-record.  */
 rr_end:
         s = $RR_END;
-        {
-            unsigned i = block->offset_start;
-            unsigned rdlength;
-
-            /* skip domain name */
-            i += block->buf[i] + 1;
-
-            rdlength = block->offset - i - 8;
-            block->buf[i+6] = (unsigned char)(rdlength>>8);
-            block->buf[i+7] = (unsigned char)(rdlength>>0);
-            block->offset_start = block->offset;
-        }
+        block_rr_finish(block);
+        if (block->offset + 64*1024 > sizeof(block->buf)
+            || parser->is_singlestep)
+            block = block_next_to_parse(parser);
 		s = $UNTIL_EOL;
 
 	case $UNTIL_EOL:
@@ -840,14 +736,21 @@ rr_end:
 		s = $LINE_START;
 
 	case $LINE_START:
-        /* See if we need to start a new buffer */
-        if (block->offset + 64*1024 > sizeof(block->buf))
-            block_next_to_parse(parser);
 
 		switch (buf[i]) {
 		case ' ':
 		case '\t':
+            /* If the line starts with a space, then that means we'll use the
+             * the domain-name from the previous line, and just skip to the
+             * next field */
+            block->buf[block->offset] = (unsigned char)block->domain.length;
+            memcpy(&block->buf[block->offset]+1, block->domain.name, block->domain.length);
+            block->offset += block->domain.length + 1;
+            block->buf[block->offset] = 0xA3;
+
 			s = $TYPE;
+            parser->s2 = 0;
+               
 			continue;
 		case '\r':
 			s = $EOL;
@@ -863,48 +766,37 @@ rr_end:
 		case ';':
 			s = $COMMENT;
 			continue;
+        default:
+                s = $DOMAIN;
+                
+                /* Mark the start of the next resource record */
+                assert(block->offset_start == block->offset);
+                
+                parser->s2 = 0;
+                parser->rr_domain.name = block->buf + block->offset + 1;
+                
 		}
-		s = $DOMAIN;
-
-        /* Mark the start of the next resource record */
-        assert(block->offset_start == block->offset);
-        parser->s2 = 0;
-        parser->rr_domain.name = block->buf + block->offset + 1;
-
-        //mm_domain_start(parser);
-
-#if 0 && defined(EVIL_KLUDGES)
-        {
-            __m128i input;
-            unsigned len;
-            input =  _mm_loadu_si128((const __m128i*)(buf+i));
-            len = _mm_cmpistri(domain_endchar, input, _SIDD_CMP_EQUAL_ANY);
-
-            if (len && len < length-i) {
-                //printf("%.*s\n", len, buf+i);
-                parser->domain.label = 0;
-                parser->domain.name[0] = (unsigned char)len;
-                parser->domain.length = (unsigned char)(len + 1);
-                memcpy(parser->domain.name+1, buf+i, len);
-                parser->s2 = 1;
-                i += len;
-                if (buf[i] == ' ') {
-                    s = $TYPE;
-                    goto state_type;
-                }
-            }
-        }
-#endif
+        /*
+         * Drop down and start processing the next domain name
+         */
+        
 		
 	case $DOMAIN:
 		x_parse_domain(parser, buf, &i, length);
 		if (i >= length)
 			break;
+            
+        /* Save this domain name in case the next line starts with spaces */
+        block->domain.name = parser->rr_domain.name;
+        block->domain.length = parser->rr_domain.length;
+            
+        /* this is special logic done for domain-names that you wouldn't
+         * normally find when parsing domain-names within RRs */
         block->buf[block->offset] = parser->rr_domain.length;
         block->offset += parser->rr_domain.length + 1;
         block->buf[block->offset] = 0xA3;
-        //mm_domain_end(parser);
-		s = $TYPE;
+        
+        s = $TYPE;
 
 	case $TYPE:
 		parser->s2 = 0;
@@ -919,12 +811,14 @@ rr_end:
 			 * mark this type then move onto the RR contents */
 
             /* First, align the start of the buffer */
+            *(unsigned*)(&block->buf[block->offset]) = parser->src.line_number;
+            block->offset += 4;
             block->buf[block->offset++] = (unsigned char)(type>>8);
             block->buf[block->offset++] = (unsigned char)(type>>0);
-            block->buf[block->offset++] = (unsigned char)(parser->ttl>>24);
-            block->buf[block->offset++] = (unsigned char)(parser->ttl>>16);
-            block->buf[block->offset++] = (unsigned char)(parser->ttl>> 8);
-            block->buf[block->offset++] = (unsigned char)(parser->ttl>> 0);
+            block->buf[block->offset++] = (unsigned char)(parser->block->ttl>>24);
+            block->buf[block->offset++] = (unsigned char)(parser->block->ttl>>16);
+            block->buf[block->offset++] = (unsigned char)(parser->block->ttl>> 8);
+            block->buf[block->offset++] = (unsigned char)(parser->block->ttl>> 0);
             block->buf[block->offset++] = (unsigned char)(0); /* placeholder for RDLENGTH */
             block->buf[block->offset++] = (unsigned char)(0); /* placeholder for RDLENGTH */
 
@@ -937,12 +831,21 @@ rr_end:
 			case TYPE_NSEC3PARAM:	s = $RR_NSEC3PARAM;	continue;
 			case TYPE_RRSIG:		s = $RR_RRSIG;		continue;
 			case TYPE_DS:			s = $RR_DS;			continue;
+			case TYPE_TLSA:			s = $RR_TLSA;		continue;
+            case TYPE_SSHFP:        s = $RR_SSHFP;      continue;
 			case TYPE_A:			s = $RR_A;			mm_integer_start(parser); continue;
 			case TYPE_AAAA:			s = $RR_AAAA;		mm_ipv6_start(parser); continue;
+			case TYPE_LOC:			s = $RR_LOC;		mm_location_start(parser); continue;
 			case TYPE_TXT:			s = $RR_TXT_START;	continue;
             case TYPE_SRV:          s = $RR_TXT_START;  continue;
+            case TYPE_SPF:          s = $RR_TXT_START;  continue;
+            case TYPE_HINFO:        s = $RR_TXT_START;  continue;
 			case TYPE_MX:			s = $RR_MX;			mm_integer_start(parser); continue;
+			case TYPE_PTR:		    s = $RR_PTR;		mm_domain_start(parser); continue;
 			case TYPE_CNAME:		s = $RR_CNAME;		mm_domain_start(parser); continue;
+                case TYPE_COMMENT:
+                    printf(".\n");
+                    break;
 			default:
 				parse_err(parser, "unknown type: %u\n", type);
 				s = $PARSE_ERROR;
@@ -958,13 +861,20 @@ rr_end:
 			/* reached end of buffer fragment without completing search,
 			 * so loop around and try again */
 			continue;
+        } else if (type == TYPE_COMMENT) {
+            s = $COMMENT;
+            /*KLUDGE: we've set the domain-name assuming we were copying
+             * the previous domain for an RR. Since ther'es no RR here just
+             * a comment, we need to reset this */
+            block->offset = block->offset_start;
+            continue;        
 		} else if (parser->s2 == 0) {
 			/* either comment or TTL */
 			if (buf[i] == ';') {
 				s = $COMMENT;
-				continue;
+                continue;
 			} else if ('0' <= buf[i] && buf[i] <= '9') {
-				parser->ttl = buf[i] - '0';
+				parser->block->ttl = buf[i] - '0';
 				s = $TTL;
 				continue;
 			} else {
@@ -978,7 +888,7 @@ rr_end:
 			parser->s2 = 0;
 			continue;
 		} else {
-			parse_err(parser, "unknown parser\n");
+			parse_err(parser, "unknown parser: %.10s\n", buf+i-1);
 			s = $PARSE_ERROR;
 		} 
 		continue;
@@ -989,6 +899,9 @@ rr_end:
 		continue;
 
 	case $COMMENT:
+        /* Should only encounter this on blank-lines with comments. Otherwise,
+         * comments should normally be handled within the states for 
+         * individual records */
 		while (i<length && buf[i] != '\n')
 			i++;
 		if (i < length)
@@ -999,7 +912,7 @@ rr_end:
 		x_parse_ttl(parser, buf, &i, length);
 		if (i >= length)
 			break;
-        parser->ttl = parser->rr_number & 0xFFFFFFFF;
+        parser->block->ttl = parser->rr_number & 0xFFFFFFFF;
 		i--;
 		s = $TYPE;
 		continue;
@@ -1008,7 +921,7 @@ rr_end:
 		x_parse_ttl(parser, buf, &i, length);
 		if (i >= length)
 			break;
-        parser->ttl = parser->rr_number & 0xFFFFFFFF;
+        parser->block->ttl = parser->rr_number & 0xFFFFFFFF;
 		i--;
 		s = $UNTIL_EOL;
 		continue;
@@ -1081,6 +994,7 @@ rr_end:
 
 	/*****************/
 	case $RR_CNAME:
+    case $RR_PTR:
 		x_parse_domain(parser, buf, &i, length);
 		if (i >= length)
 			break;
@@ -1127,6 +1041,15 @@ rr_end:
 		goto rr_end;
 
 	/*****************/
+	case $RR_LOC:
+		mm_location_parse(parser, buf, &i, length);
+		if (i >= length)
+			break;
+        mm_location_end(parser);
+		s = $RR_END;
+		goto rr_end;
+
+	/*****************/
 	case $RR_TXT_START:
         mm_buffer_start(parser);
         s = $RR_TXT;
@@ -1145,18 +1068,55 @@ rr_end:
 		s = $RR_END;
 		goto rr_end;
 
+    /*
+                           1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
+       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+       |   algorithm   |    fp type    |                               /
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               /
+       /                                                               /
+       /                          fingerprint                          /
+       /                                                               /
+       +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    */
+    case $RR_SSHFP:
+        s = $RR_SSHFP_ALGO;
+        mm_integer_start(parser);
+	case $RR_SSHFP_ALGO:
+		x_parse_ttl(parser, buf, &i, length);
+		if (i >= length)
+			break;
+        mm_integer8_end(parser);
+		mm_integer_start(parser);
+		s = $RR_SSHFP_TYPE;
+	case $RR_SSHFP_TYPE:
+		x_parse_ttl(parser, buf, &i, length);
+		if (i >= length)
+			break;
+        mm_integer8_end(parser);
+		mm_hex_start(parser);
+		s = $RR_SSHFP_FP;
+	case $RR_SSHFP_FP:
+		x_parse_hex(parser, buf, &i, length, 1);
+		if (i >= length)
+			break;
+        mm_hex_end(parser);
+		s = $RR_END;
+		goto rr_end;
+
+
 	/*****************/
-        /*
-                                1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
-            0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-           +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-           |              Flags            |    Protocol   |   Algorithm   |
-           +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-           /                                                               /
-           /                            Public Key                         /
-           /                                                               /
-           +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        */
+    /*
+                            1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
+        0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        |              Flags            |    Protocol   |   Algorithm   |
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        /                                                               /
+        /                            Public Key                         /
+        /                                                               /
+        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    */
 	case $RR_DNSKEY:
 		s = $RR_DNSKEY_FLAGS;
 		mm_integer_start(parser);
@@ -1186,6 +1146,49 @@ rr_end:
 		if (i >= length)
 			break;
         mm_base64_end(parser);
+		s = $RR_END;
+		goto rr_end;
+
+	/*
+                        1 1 1 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 3 3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |  Cert. Usage  |   Selector    | Matching Type |               /
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+               /
+   /                                                               /
+   /                 Certificate Association Data                  /
+   /                                                               /
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   */
+	case $RR_TLSA:
+		s = $RR_TLSA_USAGE;
+		mm_integer_start(parser);
+	case $RR_TLSA_USAGE:
+		x_parse_ttl(parser, buf, &i, length);
+		if (i >= length)
+			break;
+        mm_integer8_end(parser);
+		mm_integer_start(parser);
+		s = $RR_TLSA_SELECTOR;
+	case $RR_TLSA_SELECTOR:
+		x_parse_ttl(parser, buf, &i, length);
+		if (i >= length)
+			break;
+        mm_integer8_end(parser);
+		mm_integer_start(parser);
+		s = $RR_TLSA_TYPE;
+	case $RR_TLSA_TYPE:
+		x_parse_ttl(parser, buf, &i, length);
+		if (i >= length)
+			break;
+        mm_integer8_end(parser);
+		mm_hex_start(parser);
+		s = $RR_TLSA_CERT;
+	case $RR_TLSA_CERT:
+		x_parse_hex(parser, buf, &i, length, 1);
+		if (i >= length)
+			break;
+        mm_hex_end(parser);
 		s = $RR_END;
 		goto rr_end;
 
@@ -1492,7 +1495,7 @@ rr_end:
 				i--;
 				s = $ORIGIN;
                 mm_domain_start(parser);
-                parser->rr_domain.name = parser->origin_buffer;
+                parser->rr_domain.name = block->origin_buffer;
 				parser->s2 = 0;
 				continue;
 			case 2: /* $TTL */
@@ -1541,17 +1544,9 @@ rr_end:
 
         /* We need to update both the 'parser' and the current 'block' with
          * the new origin info */
-        parser->origin.length = parser->rr_domain.label;
-        {
-            struct ParsedBlock *block = parser->block;
-
-            memcpy( block->origin_buffer,
-                    parser->origin.name,
-                    parser->origin.length);
-            block->origin.name = block->origin_buffer;
-            block->origin.length = parser->origin.length;
-        }
-
+        parser->block->origin.length = parser->rr_domain.label;
+        parser->block->origin.name = parser->block->origin_buffer;
+        
 		i--;
 		s = $UNTIL_EOL;
 		continue;
@@ -1614,19 +1609,28 @@ zonefile_parse(
 	    );
 }
 
-/****************************************************************************
+/******************************************************************************
+ ******************************************************************************/
+void
+zonefile_set_singlestep(struct ZoneFileParser *parser)
+{
+    parser->is_singlestep = 1;
+}
+
+/******************************************************************************
  * Call this to create a parser for parsing a file.
  * @return an object suitable for parsing
- ****************************************************************************/
+ ******************************************************************************/
 struct ZoneFileParser *
 zonefile_begin(struct DomainPointer origin, uint64_t ttl, uint64_t filesize,
-    const char *filename, RESOURCE_RECORD_CALLBACK callback, void *callbackdata)
+    const char *filename, RESOURCE_RECORD_CALLBACK callback, void *callbackdata,
+    unsigned extra_threads)
 {
     struct ZoneFileParser *parser;
 
-    parser = (struct ZoneFileParser *)malloc(sizeof(parser[0]));
+    parser = MALLOC2(sizeof(parser[0]));
     memset(parser, 0, sizeof(parser[0]));
-  	
+
     /* remember filesize as a hint when creating the zone hash table */
     parser->filesize = filesize;
     parser->callback = callback;
@@ -1636,23 +1640,41 @@ zonefile_begin(struct DomainPointer origin, uint64_t ttl, uint64_t filesize,
     parser->type_dfa = _type_dfa;
 	parser->variable_dfa = _variable_dfa;
 
-    if (origin.length) {
-        parser->origin.length = (unsigned char)origin.length;
-        parser->origin.name = parser->origin_buffer;
-        memcpy(parser->origin_buffer, origin.name, parser->origin.length);
-    }
-    if (ttl) {
-        parser->ttl = ttl;
-    }
-
-    parser->block = &parser->blocks[0];
-
-    memcpy(parser->block->origin_buffer, parser->origin_buffer, 256);
-    parser->block->origin.name = parser->block->origin_buffer;
-    parser->block->origin.length = parser->origin.length;
-
+    /*
+     * Initialize the "block-insertion" system
+     */
+    parser->additional_threads = extra_threads;
+    parser->block = block_init(parser, origin, ttl);
 
     return parser;
+}
+
+/******************************************************************************
+ * Call this to re-use the parser to parse multiple files
+ ******************************************************************************/
+void
+zonefile_begin_again(
+    struct ZoneFileParser *parser,
+    struct DomainPointer origin, uint64_t ttl, uint64_t filesize,
+    const char *filename)
+{
+    struct ParsedBlock *block;
+
+    /* remember filesize as a hint when creating the zone hash table */
+    parser->filesize = filesize;
+    parser->src.filename = filename;
+
+    /* move to a new block */
+    block = block_next_to_parse(parser);
+    if (block->filesize != filesize) {
+        memcpy(block->filename, parser->src.filename, sizeof(block->filename));
+        block->filesize = parser->filesize;
+    }
+
+
+    block->ttl = ttl;
+    block->origin.name = origin.name;
+    block->origin.length = origin.length;
 }
 
 /****************************************************************************
@@ -1662,7 +1684,16 @@ zonefile_end(struct ZoneFileParser *parser)
 {
     int result;
     
+
+    /*
+     * Wait for all threads to finish inserting data
+     */
     zonefile_flush(parser);
+
+    /*
+     * Cleanup the block-insertiong stuff
+     */
+    block_end(parser);
 
     if (parser->src.error_count)
         result = Failure;
@@ -1698,32 +1729,11 @@ zonefile_parser_init(void)
  ****************************************************************************/
 int zonefile_flush(struct ZoneFileParser *parser)
 {
-    unsigned i;
-    int x;
-    struct ParsedBlock *block = parser->block;
+    /* First, terminate processing of the current block */
+    block_next_to_parse(parser);
 
-    /* First, flush the current block. This will normally be the only block
-     * that we process. */
-    block->status = BLOCK_FULL;
-    x = thread_compare_and_swap(&parser->block->status, BLOCK_EMPTY, BLOCK_INSERTING);
-    if (x)
-        block_process(parser->block, parser->callback, parser->callbackdata, parser->filesize);
-
-    /* Now wait until all blocks have been flushed */
-    for (;;) {
-        int is_empty = 1;
-        for (i=0; i<sizeof(parser->blocks)/sizeof(parser->blocks[0]); i++) {
-            block = &parser->blocks[i];
-            if (block->offset) {
-                x = thread_compare_and_swap(&parser->block->status, BLOCK_FULL, BLOCK_INSERTING);
-                if (x)
-                    block_process(parser->block, parser->callback, parser->callbackdata, parser->filesize);
-                is_empty = 0;
-            }
-        }
-        if (is_empty)
-            break;
-    }
+    /* Second, wait for all blocks to be processed */
+    block_flush(parser);
 
     return Success;
 }

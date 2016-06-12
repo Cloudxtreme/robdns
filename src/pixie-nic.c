@@ -1,6 +1,7 @@
 #include "pixie-nic.h"
 #include "string_s.h"
 #include "util-ipaddr.h"
+#include "util-realloc2.h"
 #include "adapter-pcaplive.h"
 
 unsigned pixie_nic_exists(const char *ifname)
@@ -448,11 +449,7 @@ pixie_nic_gateway(const char *ifname, unsigned *ipv4)
     /*
      * Allocate a proper sized buffer
      */
-    pAdapterInfo = (IP_ADAPTER_INFO *)malloc(sizeof (IP_ADAPTER_INFO));
-    if (pAdapterInfo == NULL) {
-        fprintf(stderr, "Error allocating memory needed to call GetAdaptersinfo\n");
-        return EFAULT;
-    }
+    pAdapterInfo = MALLOC2(sizeof (IP_ADAPTER_INFO));
 
     /*
      * Query the adapter info. If the buffer is not big enough, loop around
@@ -462,15 +459,11 @@ again:
     err = GetAdaptersInfo(pAdapterInfo, &ulOutBufLen);
     if (err == ERROR_BUFFER_OVERFLOW) {
         free(pAdapterInfo);
-        pAdapterInfo = (IP_ADAPTER_INFO *)malloc(ulOutBufLen);
-        if (pAdapterInfo == NULL) {
-            fprintf(stderr, "Error allocating memory needed to call GetAdaptersinfo\n");
-            return EFAULT;
-        }
+        pAdapterInfo = (IP_ADAPTER_INFO *)MALLOC2(ulOutBufLen);
         goto again;
     }
     if (err != NO_ERROR) {
-        fprintf(stderr, "GetAdaptersInfo failed with error: %u\n", err);
+        fprintf(stderr, "GetAdaptersInfo failed with error: %u\n", (unsigned)err);
         return EFAULT;
     }
 
@@ -540,7 +533,6 @@ again:
             const IP_ADDR_STRING *addr;
 
             for (addr = &pAdapter->GatewayList; addr; addr = addr->Next) {
-                int err;
                 unsigned offset;
                 struct ParsedIpAddress ipx;
 
@@ -576,11 +568,7 @@ pixie_nic_get_mac(const char *ifname, unsigned char *mac)
     /*
      * Allocate a proper sized buffer
      */
-    pAdapterInfo = (IP_ADAPTER_INFO *)malloc(sizeof (IP_ADAPTER_INFO));
-    if (pAdapterInfo == NULL) {
-        fprintf(stderr, "Error allocating memory needed to call GetAdaptersinfo\n");
-        return EFAULT;
-    }
+    pAdapterInfo = MALLOC2(sizeof (IP_ADAPTER_INFO));
 
     /*
      * Query the adapter info. If the buffer is not big enough, loop around
@@ -590,7 +578,7 @@ again:
     err = GetAdaptersInfo(pAdapterInfo, &ulOutBufLen);
     if (err == ERROR_BUFFER_OVERFLOW) {
         free(pAdapterInfo);
-        pAdapterInfo = (IP_ADAPTER_INFO *)malloc(ulOutBufLen);
+        pAdapterInfo = (IP_ADAPTER_INFO *)MALLOC2(ulOutBufLen);
         if (pAdapterInfo == NULL) {
             fprintf(stderr, "Error allocating memory needed to call GetAdaptersinfo\n");
             return EFAULT;
@@ -598,7 +586,7 @@ again:
         goto again;
     }
     if (err != NO_ERROR) {
-        fprintf(stderr, "GetAdaptersInfo failed with error: %u\n", err);
+        fprintf(stderr, "GetAdaptersInfo failed with error: %u\n", (unsigned)err);
         return EFAULT;
     }
 
@@ -642,7 +630,7 @@ pixie_nic_get_ipv4(const char *ifname)
     /*
      * Allocate a proper sized buffer
      */
-    pAdapterInfo = (IP_ADAPTER_INFO *)malloc(sizeof (IP_ADAPTER_INFO));
+    pAdapterInfo = (IP_ADAPTER_INFO *)MALLOC2(sizeof (IP_ADAPTER_INFO));
     if (pAdapterInfo == NULL) {
         fprintf(stderr, "error:malloc(): for GetAdaptersinfo\n");
         return 0;
@@ -656,7 +644,7 @@ again:
     err = GetAdaptersInfo(pAdapterInfo, &ulOutBufLen);
     if (err == ERROR_BUFFER_OVERFLOW) {
         free(pAdapterInfo);
-        pAdapterInfo = (IP_ADAPTER_INFO *)malloc(ulOutBufLen);
+        pAdapterInfo = (IP_ADAPTER_INFO *)MALLOC2(ulOutBufLen);
         if (pAdapterInfo == NULL) {
             fprintf(stderr, "error:malloc(): for GetAdaptersinfo\n");
             return 0;
@@ -664,7 +652,7 @@ again:
         goto again;
     }
     if (err != NO_ERROR) {
-        fprintf(stderr, "GetAdaptersInfo failed with error: %u\n", err);
+        fprintf(stderr, "GetAdaptersInfo failed with error: %u\n", (unsigned)err);
         return 0;
     }
 
@@ -683,7 +671,6 @@ again:
         const IP_ADDR_STRING *addr;
 
         for (addr = &pAdapter->IpAddressList; addr; addr = addr->Next) {
-            int err;
             struct ParsedIpAddress ipx;
 
 
@@ -738,7 +725,7 @@ again:
         goto again;
     }
     if (err != NO_ERROR) {
-        fprintf(stderr, "GetAdaptersInfo failed with error: %u\n", err);
+        fprintf(stderr, "GetAdaptersInfo failed with error: %u\n", (unsigned)err);
         return EFAULT;
     }
 
@@ -750,7 +737,8 @@ again:
             pAdapter = pAdapter->Next) {
         unsigned ipv4 = 0;
 
-        if (pAdapter->Type != MIB_IF_TYPE_ETHERNET)
+        if (pAdapter->Type != MIB_IF_TYPE_ETHERNET
+			&& pAdapter->Type != 71)
             continue;
 
 
@@ -792,7 +780,7 @@ again:
 
 /*****************************************************************************
  *****************************************************************************/
-#elif defined(__APPLE__) || defined(__FreeBSD__) || 1
+#elif defined(__APPLE__) || defined(__FreeBSD__)
 #include <ctype.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -803,6 +791,12 @@ again:
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <net/route.h>
+#include <netinet/in.h>
+#include <net/if_dl.h>
+#include <ctype.h>
 
 
 #ifdef AF_LINK
@@ -886,8 +880,9 @@ get_rt_address(struct rt_msghdr *rtm, int desired)
     
 }
 
+
 unsigned
-pxie_nic_get_default(char *ifname, size_t sizeof_ifname)
+pixie_nic_get_default(char *ifname, size_t sizeof_ifname)
 {
     int fd;
     int seq = time(0);
@@ -1025,34 +1020,6 @@ pixie_nic_get_ipv4(const char *ifname)
 error:
     freeifaddrs(ifap);
     return 0;
-}
-#include <unistd.h>
-#include <sys/socket.h>
-#include <net/route.h>
-#include <netinet/in.h>
-#include <net/if_dl.h>
-#include <ctype.h>
-
-#define ROUNDUP(a)							\
-((a) > 0 ? (1 + (((a) - 1) | (sizeof(int) - 1))) : sizeof(int))
-
-struct sockaddr *
-get_rt_address(struct rt_msghdr *rtm, int desired)
-{
-    int i;
-    int bitmask = rtm->rtm_addrs;
-    struct sockaddr *sa = (struct sockaddr *)(rtm + 1);
-    
-    for (i = 0; i < RTAX_MAX; i++) {
-        if (bitmask & (1 << i)) {
-            if ((1<<i) == desired)
-                return sa;
-            sa = (struct sockaddr *)(ROUNDUP(sa->sa_len) + (char *)sa);
-        } else
-            ;
-    }
-    return NULL;
-
 }
 
 static void

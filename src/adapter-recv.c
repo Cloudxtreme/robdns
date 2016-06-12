@@ -1,5 +1,12 @@
 #include "network.h"
 #include "adapter.h"
+#include "thread.h"
+#include "proto-dns-compressor.h"
+#include "proto-dns-formatter.h"
+#include "resolver.h"
+#include "thread.h"
+#include "db-rrset.h"
+
 #include <string.h>
 
 #define VERIFY_REMAINING(n) if (offset+(n) > max) return;
@@ -62,8 +69,9 @@ network_receive(struct Frame *frame,
 
     /*
      * PARSE FIRST THEN PROCESS REQ:[d7Unn4]
-     * We parse the entire packet though DNS first before we start
-     * any processing.
+     *
+     * This parses Ethernet, IP, UDP, and DNS.
+     *
      * TODO: this will change a bit once I add TCP handling
      */
     proto_ethernet_parse(frame, px, 0, length);
@@ -81,12 +89,54 @@ network_receive(struct Frame *frame,
     switch (frame->net_protocol) {
     case NET_ARP:
         proto_arp_process(frame, frame->arp);
-        break;
+        return;
     case NET_ICMP:
         proto_icmp_process(frame, frame->icmp);
-        break;
+        return;
+    default:
+        return;
     case NET_DNS:
-        proto_dns_process(frame, frame->dns);
+        if (!frame->dns->is_valid)
+            return;
         break;
+    }
+    
+    /*
+     * Now that PARSING is done, process the DNS request
+     */
+    {
+        struct Packet pkt;
+        struct DNS_OutgoingResponse response[1];
+        struct DNS_Incoming *request = frame->dns;
+        
+
+        /* Start a "response" structure based on the "request" */
+        resolver_init(response, 
+                      request->query_name.name, 
+                      request->query_name.length, 
+                      request->query_type,
+                      request->id,
+                      request->opcode);
+        
+        /*
+         * !!! IMPORTANT !!!
+         *
+         * Take the request, run the DNS resolver algorithm, and produce
+         * a response structure.
+         *
+         */
+        resolver_algorithm(thread->catalog_run, response, request);
+        
+        
+        /*
+         * format the respone packet
+         */
+        pkt = frame_create_response(frame, NET_UDP);
+        dns_format_response(response, &pkt);
+
+        /*
+         * Transmit the response
+         */
+        frame_xmit_response(frame, &pkt);
     }
 }

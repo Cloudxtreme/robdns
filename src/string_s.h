@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 
 #undef strcpy
 #define strcpy      STRCPY_FUNCTION_IS_BAD
@@ -60,7 +61,13 @@ const char *strerror_x(int x);
 # include <string.h>
 # define strcasecmp     _stricmp
 # define memcasecmp     _memicmp
+# define strncasecmp    _strnicmp
 
+# ifndef PRIu64
+#  define PRIu64 "llu"
+#  define PRId64 "lld"
+#  define PRIx64 "llx"
+# endif
 
 
 #elif defined(_MSC_VER) && (_MSC_VER == 1200)
@@ -83,6 +90,16 @@ errno_t strcpy_s(char *dst, size_t sizeof_dst, const char *src);
 errno_t localtime_s(struct tm* _tm, const time_t *time);
 errno_t gmtime_s(struct tm* _tm, const time_t *time);
 #undef strerror
+
+#ifdef WIN32
+# ifndef PRIu64
+#  define PRIu64 "I64u"
+#  define PRId64 "I64d"
+#  define PRIx64 "I64x"
+# endif
+#else
+# include <inttypes.h>
+#endif
 
 #else
 # error unknown compiler

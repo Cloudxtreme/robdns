@@ -261,6 +261,99 @@ end:
 	*offset = i;
 }
 
+/* Control characters:
+ * 0x09 = tab
+ * 0x0a = newline
+ * 0x0d = carriage return
+ * 0x20 = space
+ * 0x22 = "
+ * 0x28 = (
+ * 0x29 = )
+ * 0x3b = ; semicolon
+ */
+char CONTROLCHAR[257] = 
+    /*0 1 2 3 4 5 6 7 8 9 a b c d e f    0 1 2 3 4 5 6 7 8 9 a b c d e f*/
+    "\0\0\0\0\0\0\0\0\0\1\1\0\0\1\0\0" "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    "\1\0\1\0\0\0\0\0\1\1\0\0\0\0\0\0" "\0\0\0\0\0\0\0\0\0\0\0\1\0\0\0\0"
+    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    ;
+
+/****************************************************************************
+ ****************************************************************************/
+unsigned
+parse_default2( struct ZoneFileParser *parser, 
+                const unsigned char *buf, unsigned *offset, unsigned *length,
+                unsigned char *c)
+{
+again:
+    *c = buf[*offset];
+
+    /*
+     * If we are currently in a comment, then process that until
+     * end-of-input or end-of-line
+     */
+    if (parser->is_commenting) {
+        while ((*offset) < (*length)  &&  buf[*offset] != '\n')
+            (*offset)++;
+        if ((*offset) >= (*length))
+            return 1; /* caller should break out of loop */
+        parser->is_commenting = 0;
+        *c = ' ';
+        return 0;
+    }
+
+
+    /*
+     * Do special processing of certain characters
+     */
+	switch (buf[*offset]) {
+    case ';':
+        /* start of comment */
+        parser->is_commenting = 1;
+        (*offset)++;
+        goto again;
+
+	case '\n':
+		if (parser->is_multiline) {
+            parser->src.line_number++;
+            (*offset)++;
+            goto again;
+        } else {
+            /* bring in the outer length, causing the parser loop
+                * to break after the current character. Presumably, 
+                * the outer parser will treat '\n' as any other 
+                * space character */
+            *length = (*offset) + 1;
+            return 0;
+        }
+        
+	case '(':
+        if (!parser->is_string) {
+			parser->is_multiline = 1;
+            (*offset)++;
+            *c = ' ';
+            return 0;
+        } else
+            return 0;
+
+	case ')':
+        if (!parser->is_string) {
+			parser->is_multiline = 0;
+            (*offset)++;
+            *c = ' ';
+            return 0;
+        } else
+            return 0;
+	}
+
+	return 0;
+}
+
 /****************************************************************************
  ****************************************************************************/
 void
@@ -400,7 +493,9 @@ x_parse_txt(
 		$TEXT, 
 		$TEXT_ESC,
 		$QUOTED,
-		$QUOTED_ESC,
+		$QUOTED_ESC0,
+		$QUOTED_ESC1,
+		$QUOTED_ESC2,
 	};
 	for (i=*offset; i<length; i++) {
 	unsigned char c = buf[i];
@@ -456,6 +551,8 @@ x_parse_txt(
             s = $END;
             continue;
         case '\\':
+            s = $QUOTED_ESC0;
+            continue;
         case '\n':
             parser->src.line_number++;
             parse_err(parser, "TXT: unhandled condition\n");
@@ -477,6 +574,52 @@ x_parse_txt(
 			goto end;
 		}
 
+		break;
+	case $QUOTED_ESC0:
+		if ('0' <= c && c <= '9') {
+			parser->substring_esc = c - '0';
+			s = $QUOTED_ESC1;
+			continue;
+		} else {
+			if (buffer->length < (65536-12))
+				buffer->data[buffer->length++] = '\\';
+			if (buffer->length < (65536-12))
+				buffer->data[buffer->length++] = c;
+			s = $QUOTED;
+			continue;
+		}
+		break;
+	case $QUOTED_ESC1:
+		if ('0' <= c && c <= '9') {
+			parser->substring_esc *= 10;
+			parser->substring_esc = c - '0';
+			s = $QUOTED_ESC2;
+			continue;
+		} else {
+			if (buffer->length < (65536-12))
+				buffer->data[buffer->length++] = (unsigned char)parser->substring_esc;
+			if (buffer->length < (65536-12))
+				buffer->data[buffer->length++] = c;
+			s = $QUOTED;
+			continue;
+		}
+		break;
+	case $QUOTED_ESC2:
+		if ('0' <= c && c <= '9') {
+			parser->substring_esc *= 10;
+			parser->substring_esc = c - '0';
+			if (buffer->length < (65536-12))
+				buffer->data[buffer->length++] = (unsigned char)parser->substring_esc;
+			s = $QUOTED;
+			continue;
+		} else {
+			if (buffer->length < (65536-12))
+				buffer->data[buffer->length++] = (unsigned char)parser->substring_esc;
+			if (buffer->length < (65536-12))
+				buffer->data[buffer->length++] = c;
+			s = $QUOTED;
+			continue;
+		}
 		break;
 
 	case $END:
@@ -725,7 +868,7 @@ x_parse_ttl(struct ZoneFileParser *parser, const unsigned char *buf, unsigned *o
             i--;
             continue;
 		default:
-			parse_err(parser, "unexpected TTL character\n");
+			parse_err(parser, "unexpected numeric character\n");
 			s = $PARSE_ERROR;
 			break;
 		}
@@ -841,6 +984,9 @@ x_parse_base64(struct ZoneFileParser *parser, const unsigned char *buf, unsigned
 		case ')':
 			parser->is_multiline = 0;
 			continue;
+        case ';':
+            s = $END;
+            goto end;
 		default:
 			parse_err(parser, "unexpected character\n");
 			s = $PARSE_ERROR;

@@ -44,12 +44,12 @@ void MurmurHash3_x64_128 ( const void * key, int len, uint32_t seed, void * out 
 //#define FORCE_INLINE __attribute__((always_inline))
 #define FORCE_INLINE 
 
-inline uint32_t rotl32 ( uint32_t x, int8_t r )
+uint32_t rotl32 ( uint32_t x, int8_t r )
 {
   return (x << r) | (x >> (32 - r));
 }
 
-inline uint64_t rotl64 ( uint64_t x, int8_t r )
+uint64_t rotl64 ( uint64_t x, int8_t r )
 {
   return (x << r) | (x >> (64 - r));
 }
@@ -120,7 +120,7 @@ void MurmurHash3_x86_32 ( const void * key, int len,
 
   for(i = -nblocks; i; i++)
   {
-    uint32_t k1 = getblock32(blocks,i);
+    k1 = getblock32(blocks,i);
 
     k1 *= c1;
     k1 = ROTL32(k1,15);

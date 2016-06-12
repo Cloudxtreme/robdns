@@ -99,7 +99,7 @@ regression_load_zonefile(struct Grind *grind, const char *directory_name)
             continue;
 
         /* load the zone-file */
-        tmp = combine_filename(directory_name, filename);
+        tmp = filename_combine(directory_name, filename);
         if (grind_load_zonefile(grind, tmp, ROOT, 0) == 0) {
             free(tmp);
             fprintf(stdout, "%s:fail: error reading zonefile file\n", filename);
@@ -175,7 +175,7 @@ regression_test_pcap(struct Grind *grind, const char *filename)
     adapter->ipv6_count = 1;
 
     memset(&thread, 0, sizeof(thread[0]));
-    thread->catalog = grind_get_catalog(grind);
+    thread->catalog_run = grind_get_catalog(grind);
     
     
     
@@ -280,7 +280,7 @@ regression_test_pcaps(struct Grind *grind, const char *directory_name)
             continue;
         
         /* Test the individual packet capture */
-        tmp = combine_filename(directory_name, filename);
+        tmp = filename_combine(directory_name, filename);
         x = regression_test_pcap(grind, tmp);
         free(tmp);
         files_tested++;

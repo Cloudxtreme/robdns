@@ -8,6 +8,7 @@
     in order to verify that compilation has succeeded.
 */
 #include "adapter.h"
+#include "configuration.h"
 #include "network.h"
 #include "zonefile-parse.h"
 #include "success-failure.h"
@@ -20,6 +21,8 @@
 #include "thread.h"
 #include "zonefile-load.h"
 #include "string_s.h"
+#include "rte-ring.h"
+#include "util-realloc2.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -90,12 +93,17 @@ struct TestAdapter
 struct Selftest
 {
     va_list marker;
-    struct Catalog *db;
+    struct Catalog *db_run;
+    struct Catalog *db_load;
     struct ZoneFileParser *parser;
     struct Thread thread[1];
     struct TestAdapter client;
     struct TestAdapter server;
 
+    /* During unite/regression test, we send a DNS query through the system,
+     * then parse the response to verify it matches what we expect as a 
+     * response. This code is set to either Failure or Success during
+     * the test */
     int test_code;
     int total_code;
 
@@ -121,7 +129,16 @@ selftest_alloc_packet(struct Adapter *adapter, struct Thread *thread)
     return pkt;
 }
 
-void selftest_client_xmit_packet(struct Adapter *adapter, struct Thread *thread, struct Packet *pkt)
+/****************************************************************************
+ * During a self-test, we intercept the client "transmit" function to
+ * instead forward directly to the server "receive" path, thus simulating
+ * from the server's point of a view the reception of a packet. We also
+ * intercept the reverse path in the function 
+ * "selftest_server_to_client_response".
+ ****************************************************************************/
+void 
+selftest_client_to_server_query(struct Adapter *adapter, 
+                            struct Thread *thread, struct Packet *pkt)
 {
     struct TestAdapter *testadapter = (struct TestAdapter *)adapter->userdata;
     struct TestAdapter *other;
@@ -133,6 +150,7 @@ void selftest_client_xmit_packet(struct Adapter *adapter, struct Thread *thread,
     else
         other = &selftest->client;
 
+    /* Save the query packet to a file for inspection */
     {
         struct PcapFile *x;
         x = pcapfile_openwrite("self-query.pcap", 1);
@@ -140,6 +158,12 @@ void selftest_client_xmit_packet(struct Adapter *adapter, struct Thread *thread,
         pcapfile_close(x);
     }
 
+    /*
+     * SHORT CIRCUIT
+     * This is supposed to be a "transmit" function from the DNS client,
+     * but what we are doing instead is just forwarding it to the 
+     * "receive" function of the DNS server.
+     */
     network_receive(
                 frame,
                 thread,
@@ -150,6 +174,8 @@ void selftest_client_xmit_packet(struct Adapter *adapter, struct Thread *thread,
                 pkt->max);
 }
 
+/****************************************************************************
+ ****************************************************************************/
 struct CheckerA
 {
     const char *rname;
@@ -169,6 +195,11 @@ struct Checker
     struct CheckerA a[100];
     struct CheckerB b[100];
 };
+enum {
+    VERIFY_PARTIAL,
+    VERIFY_EXACT = 1,
+};
+
 
 /****************************************************************************
  * Expands the packet's SOA record to a full uncompressed SOA record so
@@ -190,7 +221,7 @@ struct Checker
  *      names (because DNS name compression is done as offsets from the
  *      start of the packet).
  ****************************************************************************/
-int expand_soa(
+int decompress_soa(
     unsigned char *buf, unsigned *buf_offset, size_t buf_size,
     const unsigned char *soa, unsigned soa_length,
     const unsigned char *hdr)
@@ -227,8 +258,21 @@ int expand_soa(
 }
 
 
+/****************************************************************************
+ * Compares an expected response record 'a' with a record in the produced
+ * response packet 'b'.
+ *
+ * Normally, the response will be "failure". That's because for each
+ * expected record, we test if it exists anywhere in the response packet.
+ * Thus, the caller of this function will be going through many non-matches
+ * in a packet until it finds the match.
+ *
+ ****************************************************************************/
 int
-checker_check(const struct CheckerA *a, const struct CheckerB *b, const unsigned char *px)
+selftest_verify_one_item(
+              const struct CheckerA *a, 
+              const struct CheckerB *b, const unsigned char *px,
+              int print_message)
 {
     const unsigned char *a_name = (const unsigned char *)a->rname;
     const unsigned char *b_name = px;
@@ -239,6 +283,12 @@ checker_check(const struct CheckerA *a, const struct CheckerB *b, const unsigned
     unsigned b_rdlength;
     const unsigned char *b_rdata;
 
+    /*
+     * STEP #1:
+     *   quick checks:
+     *      type must equal
+     *      class must equal
+     */
     b_type = px[b->offset_data+0]<<8 | px[b->offset_data+1];
     if (b_type != a->rtype)
         return 0;
@@ -248,9 +298,12 @@ checker_check(const struct CheckerA *a, const struct CheckerB *b, const unsigned
     b_rdlength = px[b->offset_data+8]<<8 | px[b->offset_data+9];
     b_rdata = px + b->offset_data + 10;
 
-
+    if (print_message)
+        printf("*******************************\n");
+    
     /*
-     * First let's check the names
+     * STEP #2:
+     *  check that the "label" (domain name) matches
      */
     a_offset = 0;
     b_offset = b->offset_name;
@@ -268,6 +321,10 @@ checker_check(const struct CheckerA *a, const struct CheckerB *b, const unsigned
             ;
         b_len = b_name[b_offset++];
 
+        if (print_message) {
+            printf("\"%.*s\" -- \"%.*s\n", a_len, &a_name[a_offset], b_len, &b_name[b_offset]);
+        }
+        
         /* compare the labels */
         if (a_len != b_len)
             return 0;
@@ -284,8 +341,15 @@ checker_check(const struct CheckerA *a, const struct CheckerB *b, const unsigned
         if (a_len == 0)
             break; 
     }
-
-    /* now let's check the data */
+    if (print_message)
+        printf("names match\n");
+    
+    /* 
+     * STEP #3
+     *  check that the 'rdata' (contents) of the record matches. Note that
+     *  some records (e.g. SOA) that contain compressable domain names
+     *  need to first be decompressed/expanded.
+     */
     switch (b_type) {
     case TYPE_SOA:
         {
@@ -294,7 +358,7 @@ checker_check(const struct CheckerA *a, const struct CheckerB *b, const unsigned
             int x;
             
 
-            x = expand_soa(buf, &buf_length, sizeof(buf),
+            x = decompress_soa(buf, &buf_length, sizeof(buf),
                 b_rdata, b_rdlength,
                 px);
             if (x == Failure)
@@ -309,13 +373,22 @@ checker_check(const struct CheckerA *a, const struct CheckerB *b, const unsigned
     default:
         if (a->rdlength != b_rdlength)
             return 0;
-        return memcmp(a->rdata, b_rdata, b_rdlength) == 0;
+        {
+            
+            int x = (memcmp(a->rdata, b_rdata, b_rdlength) == 0);
+            
+            if (print_message) {
+                if (x)
+                    printf("rdata matches\n");
+                else {
+                    printf("rdata FAIL\n");
+                }
+            }
+                
+            return x;
+        }
     }
 }
- enum {
-     VERIFY_PARTIAL,
-     VERIFY_EXACT = 1,
- };
 
 /****************************************************************************
  * Verifies a response sorta matches the expected response. We do this by
@@ -328,7 +401,9 @@ checker_check(const struct CheckerA *a, const struct CheckerB *b, const unsigned
  * it's an independent check of the real code.
  ****************************************************************************/
 static int
-selftest_verify(struct Selftest *selftest, const unsigned char *px, unsigned offset, unsigned max)
+selftest_verify(struct Selftest *selftest, 
+                const unsigned char *px, unsigned offset, unsigned max,
+                int print_message)
 {
     unsigned qdcount;
     unsigned ancount;
@@ -418,7 +493,11 @@ selftest_verify(struct Selftest *selftest, const unsigned char *px, unsigned off
      * Now go through and pull out all the variable length parms
      */
     for (;;) {
-        unsigned i = checker->a_count;;
+        i = checker->a_count;
+        
+        if (print_message) {
+            printf(">");
+        }
         checker->a[i].rname = va_arg(marker, const char *);
         if (checker->a[i].rname == 0)
             break;
@@ -427,6 +506,8 @@ selftest_verify(struct Selftest *selftest, const unsigned char *px, unsigned off
         checker->a[i].rtype = va_arg(marker, int);
         checker->a_count++;
     }
+    if (print_message)
+        printf("\n");
 
     /*
      * Now make sure that the response contains all the expected data
@@ -435,7 +516,9 @@ selftest_verify(struct Selftest *selftest, const unsigned char *px, unsigned off
         unsigned j;
 
         for (j=0; j<checker->b_count; j++) {
-            if (checker_check(&checker->a[i], &checker->b[j], dns_header))
+            if (selftest_verify_one_item(&checker->a[i], 
+                                         &checker->b[j], dns_header, 
+                                         print_message))
                 break;
         }
         if (j == checker->b_count) {
@@ -448,9 +531,13 @@ selftest_verify(struct Selftest *selftest, const unsigned char *px, unsigned off
 }
 
 /****************************************************************************
+ * Send packet from the server. Of course, during self-test, we don't
+ * actually transmit the packet, but parse the result to see if it matches
+ * what we expect.
  ****************************************************************************/
 void
-selftest_server_xmit_packet(struct Adapter *adapter, struct Thread *thread, struct Packet *pkt)
+selftest_server_to_client_response(struct Adapter *adapter,
+                            struct Thread *thread, struct Packet *pkt)
 {
     struct TestAdapter *testadapter = (struct TestAdapter *)adapter->userdata;
     struct TestAdapter *other;
@@ -472,7 +559,10 @@ selftest_server_xmit_packet(struct Adapter *adapter, struct Thread *thread, stru
         pcapfile_close(x);
     }
 
-    selftest->test_code = selftest_verify(selftest, pkt->buf, 42, pkt->max);
+    selftest->test_code = selftest_verify(selftest, pkt->buf, 42, pkt->max, 0);
+    if (selftest->test_code != Success) {
+        selftest->test_code = selftest_verify(selftest, pkt->buf, 42, pkt->max, 1);
+    }
 
 }
 
@@ -583,7 +673,7 @@ QUERY(
     adapter_xmit(adapter, selftest->thread, &pkt);
 
     if (selftest->test_code == Failure) {
-        fprintf(stderr, "<selftest>:fail: qtype=%u qname=%s\n", query_type, query_name);
+        fprintf(stderr, "<selftest>:fail: qtype=%s qname=%s\n", name_of_type(query_type), query_name);
         //exit(1);
         selftest->total_code = Failure;
         return Failure;
@@ -591,6 +681,8 @@ QUERY(
 
     return Success;
 }
+
+
 
 /****************************************************************************
  * [1] test "zonefile" parser
@@ -609,16 +701,31 @@ QUERY(
 int
 selftest(int argc, char *argv[])
 {
-    struct Selftest selftest[1];
+    struct Selftest *selftest = REALLOC2(NULL, sizeof(*selftest), 1);
 	struct ZoneFileParser *parser;
     unsigned parse_results;
     unsigned i;
     const char *element;
-    struct Catalog *db;
+    struct Catalog *db_load;
     
 
     UNUSEDPARM(argc);
     UNUSEDPARM(argv);
+    
+
+    if (cfg_selftest() != 0) {
+        fprintf(stderr, "conf: selftest failed\n");
+        return Failure;
+    }
+
+    /*
+     * RING selftest
+     */
+    if (rte_ring_selftest() != 0) {
+        fprintf(stderr, "rte-ring: selftest failed\n");
+        return Failure;
+    }
+
 
     selftest->total_code = Success;
 
@@ -628,12 +735,12 @@ selftest(int argc, char *argv[])
     selftest->client.parent = selftest;
     selftest->client.adapter = adapter_create(
                                     selftest_alloc_packet, 
-                                    selftest_client_xmit_packet, 
+                                    selftest_client_to_server_query, 
                                     &selftest->client);
     selftest->server.parent = selftest;
     selftest->server.adapter = adapter_create(
                                     selftest_alloc_packet, 
-                                    selftest_server_xmit_packet, 
+                                    selftest_server_to_client_response, 
                                     &selftest->server);
     adapter_add_ipv4(selftest->client.adapter, 0x0a000001, 0xFFFFffff);
     adapter_add_ipv4(selftest->server.adapter, 0xC0A00002, 0xFFFFffff);
@@ -641,9 +748,11 @@ selftest(int argc, char *argv[])
 
     /* create a catalog/database, this is where all the parsed zonefile
      * records will be put */
-    selftest->db = catalog_create();
-    selftest->thread->catalog = selftest->db;
-    db = selftest->db;
+    selftest->db_run = catalog_create();
+    selftest->db_load = selftest->db_run;
+
+    selftest->thread->catalog_run = selftest->db_run;
+    db_load = selftest->db_load;
 
     /* create a parser object */
     parser = zonefile_begin(
@@ -652,7 +761,8 @@ selftest(int argc, char *argv[])
                 10000,          /* filesize */
                 "<selftest>",   /* filename */
                 zonefile_load,  /* callback */
-                db              /* callback data */
+                db_load,
+                0
                 );
     selftest->parser = parser;
 
@@ -665,6 +775,7 @@ selftest(int argc, char *argv[])
          "                     1209600    ; ex = expiry = 2w\r\n"
          "                     1H         ; nx = nxdomain ttl = 1h\r\n"
          "                     )\r\n", parser);
+
     QUERY("example.com.", TYPE_SOA, selftest,
         "example.com.", 0x3c, 
                 "\x02" "ns" "\x07" "example" "\x03" "com" "\x00"
@@ -675,7 +786,7 @@ selftest(int argc, char *argv[])
                 "\x00\x12\x75\x00"
                 "\x00\x00\x0e\x10",
         TYPE_SOA,
-        0);
+        NULL);
 
 
     /*
@@ -685,11 +796,11 @@ selftest(int argc, char *argv[])
     LOAD("hydrogen A 1.0.0.1                ; a simple IP address\n", parser);
     QUERY("hydrogen", TYPE_A, selftest,
         "hydrogen.example.com.", 4, "\1\0\0\1", TYPE_A,
-        0, selftest);
+        NULL, selftest);
     selftest->is_edns0 = 1;
     QUERY("hydrogen", TYPE_A, selftest,
         "hydrogen.example.com.", 4, "\1\0\0\1", TYPE_A,
-        0, selftest);
+        NULL, selftest);
     
     /*
      * tests that an "Entry" can hold multiple "RRsets", in this case
@@ -702,7 +813,7 @@ selftest(int argc, char *argv[])
         "helium.example.com", 4, "\2\0\0\1", TYPE_A,
         "helium.example.com", 13, "\x0c" "hello, world", TYPE_TXT,
         "helium.example.com", 16, "\x20\2\0\0\0\0\0\0\0\0\0\0\0\0\0\1", TYPE_AAAA,
-        0);
+        NULL);
 
 
     /*
@@ -723,23 +834,28 @@ selftest(int argc, char *argv[])
         "lithium.example.com", 4, "\3\0\0\2", TYPE_A,
         "lithium.example.com", 4, "\3\0\0\3", TYPE_A,
         "lithium.example.com", 4, "\3\0\0\4", TYPE_A,
-        0);
+        NULL);
     QUERY("lithium", TYPE_TXT, selftest,
         "lithium.example.com", 6, "\x05" "hello", TYPE_TXT,
         "lithium.example.com", 6, "\x05" "world", TYPE_TXT,
         "lithium.example.com", 3, "\x02" "42", TYPE_TXT,
         "lithium.example.com", 22, "\x15" "don't eat yellow snow", TYPE_TXT,
-        0);
+        NULL);
 
     /*
      * This verifies that domain-names are case-insensitive
      */
     LOAD("Beryllium A 4.0.0.1               ; case sensitivity\n", parser);
     LOAD("bErYlLiUm A 4.0.0.2               ; case sensitivity\n", parser);
+    QUERY("Beryllium", TYPE_A, selftest,
+          "Beryllium.example.com", 4, "\4\0\0\1", TYPE_A,
+          "Beryllium.example.com", 4, "\4\0\0\2", TYPE_A,
+          NULL);
+
     QUERY("berylliuM", TYPE_A, selftest,
-        "berylliuM.example.com", 4, "\4\0\0\1", TYPE_A,
-        "berylliuM.example.com", 4, "\4\0\0\2", TYPE_A,
-        0);
+          "berylliuM.example.com", 4, "\4\0\0\1", TYPE_A,
+          "berylliuM.example.com", 4, "\4\0\0\2", TYPE_A,
+          NULL);
 
     /* try to cause a buffer overflow */
     element = "boron";
@@ -760,7 +876,7 @@ selftest(int argc, char *argv[])
     }
     QUERY("0007.boron", TYPE_TXT, selftest,
         "0007.boron.example.com", 2, "\x01" "o", TYPE_TXT,
-        0);
+        NULL);
 
     /* try to cause a buffer overflow */
     element = "nitrogen";
@@ -787,7 +903,84 @@ selftest(int argc, char *argv[])
     LOAD("\"bb\" \"ccc\" )\n", parser);
     QUERY("oxygen", TYPE_TXT, selftest,
         "oxygen.example.com", 9, "\x01" "a" "\x02" "bb" "\x03" "ccc", TYPE_TXT,
-        0);
+        NULL);
+
+    /*
+     * LOC record
+     * Example from:
+     * http://blog.cloudflare.com/the-weird-and-wonderful-world-of-dns-loc-records
+     */
+    LOAD("geekatlas.flourine  IN LOC   (\n"
+            "   33 40 31.000 N;latitude\n"
+            "   106 28 29.000 W ;longitude\n"
+            "   10.00m\n1m 10000m 10m)\n", parser);
+    QUERY("geekatlas.flourine", TYPE_LOC, selftest,
+        "geekatlas.flourine.example.com", 16, 
+            "\x00" /* version */
+            "\x12"  /* size = 1 meter*/
+            "\x16"  /* h-prez = 10000 meters */
+            "\x13"  /* v-prez = 10 meters */
+            "\x87\x39\xd6\x98"
+            "\x69\x27\x2b\x38"
+            "\x00\x98\x9a\x68",
+            TYPE_LOC, NULL);
+    LOAD(";; network LOC RR derived from ZIP data.  note use of precision defaults\n"
+        "rfc1876.flourine          LOC   42 21 54 N 71 06 18 W -24m 30m\n\n"
+        ";; higher-precision host LOC RR.  note use of vertical precision default\n"
+        "rfc1876.flourine          LOC   42 21 43.952 N 71 5 6.344 W -24m 1m 200m\n\n"
+        "rfc1876.flourine          LOC   52 14 05 N 00 08 50 E 10m\n\n"
+        "rfc1876.flourine          LOC   32 7 19 S 116 2 25 E 10m\n\n"
+        "rfc1876.flourine          LOC   42 21 28.764 N 71 00 51.617 W -44m 2000m\n" 
+        , parser);
+    QUERY("rfc1876.flourine", TYPE_LOC, selftest,
+            "rfc1876.flourine.example.com", 16, 
+            "\x00\x12\x16\x13\x79\x1b\x7d\x28\x98\xe6\x48\x68\x00\x98\x9a\x68",
+            TYPE_LOC, 
+
+            "rfc1876.flourine.example.com", 16, 
+            "\x00\x12\x16\x13\x8b\x35\x56\xc8\x80\x08\x16\x50\x00\x98\x9a\x68",
+            TYPE_LOC, 
+
+            "rfc1876.flourine.example.com", 16, 
+            "\x00\x12\x24\x13\x89\x17\x06\x90\x70\xbf\x2d\xd8\x00\x98\x8d\x20",
+            TYPE_LOC, 
+
+            "rfc1876.flourine.example.com", 16, 
+            "\x00\x25\x16\x13\x89\x16\xcb\x3c\x70\xc3\x10\xdf\x00\x98\x85\x50",
+            TYPE_LOC, 
+
+            "rfc1876.flourine.example.com", 16, 
+            "\x00\x33\x16\x13\x89\x17\x2d\xd0\x70\xbe\x15\xf0\x00\x98\x8d\x20",
+            TYPE_LOC, 
+            
+            NULL);
+    
+   
+    /*
+     * Wildcards
+     */
+    LOAD("*.neon  IN A 10.2.3.255\n", parser);
+    QUERY("test.neon", TYPE_A, selftest,
+        "test.neon.example.com", 4, "\x0a\x02\x03\xff", TYPE_A,
+        NULL);
+
+    /*
+     * HINFO RR (host information record)
+     */
+    LOAD("win.sodium    IN HINFO \"x86\" \"WinNT-4.0\"\n", parser);
+    QUERY("win.sodium", TYPE_HINFO, selftest,
+        "win.sodium.example.com", 14, "\x03" "x86" "\x09" "WinNT-4.0", TYPE_HINFO,
+        NULL);
+    LOAD("sol.sodium    IN HINFO SPARC-64 SunOS/4.1.3\n", parser);
+    QUERY("sol.sodium", TYPE_HINFO, selftest,
+        "sol.sodium.example.com", 21, "\x08" "SPARC-64" "\x0b" "SunOS/4.1.3", TYPE_HINFO,
+        NULL);
+
+
+    LOAD("magnesium  SSHFP 2 1 123456789abcdef67890123456789abcdef67890\n", parser);
+    QUERY("magnesium", TYPE_SSHFP, selftest,
+        "magnesium.example.com", 22, "\x02\x01" "\x12\x34\x56\x78\x9a\xbc\xde\xf6\x78\x90\x12\x34\x56\x78\x9a\xbc\xde\xf6\x78\x90", TYPE_SSHFP,
+        NULL);
 
 
     /* we are now done parsing the zonefile, so free the parser */

@@ -10,6 +10,7 @@
 #include "db.h"
 #include "db-zone.h"
 #include "string_s.h"
+#include "util-realloc2.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -46,7 +47,8 @@ selftest2(int argc, char *argv[])
             zonetext_size,  /* filesize */
             "<selftest>",   /* filename */
             zonefile_load,  /* callback */
-            catalog         /* callback data */
+            catalog,        /* callback data */
+            0
             );
 
     LOAD("$TTL 60\r\n"
@@ -63,7 +65,9 @@ selftest2(int argc, char *argv[])
     /*
      * Create a huge number of entries
      */
-    zonetext = (unsigned char*)malloc(zonetext_size);
+    zonetext = MALLOC2(zonetext_size);
+    if (zonetext == 0)
+        return -1;
     for (;;) {
         char tmp[256];
         switch (myrand(&seed)&0xF) {

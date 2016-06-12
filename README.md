@@ -1,69 +1,71 @@
-# robdns: a fast DNS server
+# robdns: infrastructure DNS server
 
-This DNS server bypasses the kernel. It has it's own TCP/IP stack
-that interacts directly with the network adapter. It's designed
-to service DNS requests at rates of 10 million per second.
+This is a fast super-slave DNS server, designed to be constantly attacked
+on the public Internet. The intent is to shield master servers that are
+hidden behind firewalls. The key feature is a built-in custom TCP/IP stack
+capable of handling millions of DNS queries-per-second per CPU core.
 
-Currently it is in "prototype" stage. There is much that almost works,
-but will still take some effort to finish.
+Currently, this tool is in a prototype stage. It parses records and
+responds to queries on port 53, but it's missing key features such
+as dynamic updates.
+
 
 # Building
 
-On Debian/Ubuntu, it goes something like this:
+The only dependency is `libpcap-dev` (or `WinPcap`).
 
-	$ git clone https://github.com/robertdavidgraham/robdns
-	$ cd robdns
-	$ make
-	$ make regress
+Just type `make` to build the software on Linux, Mac OS X, and Windows 
+(MinGW).
 
-This puts the program in the `robdns/bin` subdirectory. You'll have to
-manually copy it to something like `/usr/local/bin` if you want to
-install it elsewhere on the system.
-
-While Linux is the primary target platform, the code runs well on many other
-systems. Here's some additional build info:
-* Windows w/ Visual Studio: use the VS10 project
-* Windows w/ MingGW: just type `make`
-* Windows w/ cygwin: won't work
-* Mac OS X /w XCode: use the XCode4 project
-* Mac OS X /w cmdline: just type `make`
-* FreeBSD: type `gmake`
-* other: I don't know, don't care
+The included XCode4 and VS10 projects should also work on Mac and 
+Windows respectively.
 
 
-# Usage
+# Running
 
-The easiest way to run this server is simply to run it on the command-line
-with one or more DNS zone-files:
+The easiest way to test the server is to run on the comman-line with one
+or more DNS zone-files, like so:
 
 	# robdns example.zone
 
-The zone file is assumed to be in standard BIND9 format starting with an
-SOA record, and containing only records/glue within the zone.
+This will start listening on the `any` IP address (v4 and v6) on port 53.
+Zone-files are in the standard format, with a filename ending in `.zone`,
+and starting with an SOA record.
 
-By default, this will use the IP address of the primary network adapter.
-This causes some difficulties, because incoming packets will be sent both
-to the normal network stack and to this program. For best results, use
-a different network address not used by another machine on the local subnet.
+To test that it's running, you can use the normal `dig` command.
 
-	# robdns example.con 192.168.1.222
+	$ dig chaos txt version.bind @localhost +short
+    
+You should get back the version string of `robdns/1`.
 
-To verify that it's working, use the `dig` tool from another machine:
 
-	$ dig chaos txt version.bind @192.168.1.122
+However, the above example is the **slow** way of running the software.
+The intended use is to bypass the kernel's network stack using special
+drivers like PF_RING. To run in this faster mode, install the drivers
+and run with a command like the following:
 
-This should return a record with the value of `robdns/1`. Then, try normal
-DNS requests, such as:
+    # robdns example.zone dna0 192.168.1.222
 
-	$ dig ns1.example.com @192.168.1.122
+In this example, the server will use it's own user-mode TCP/IP stack
+instead. Currently, this benchmarks to about 1-million packets-per-second
+for each CPU core.
 
-There is a sample `example.zone` file to test with in the top directory. Or,
-consider getting a copy of the `com.zone` file (8-gigabytes) to test with.
 
-# Features
+# Feature status
 
-This server has no particular features at this time, other than bypassing
-the kernel.
+The following RR types have been implemented:
+
+	SOA, NS,
+	A, AAAA, PTR, CNAME,
+	SSHFP, LOC, TXT, SRV, SPF, HINFO, MX,
+	DNSKEY, NSEC, NSEC3, NSEC3PARAM, RRSIG, DS, TLSA,
+	EDNS0,
+	
+
+The following interfaces are supported:
+	sockets, libpcap, PF_RING
+
+
 
 # Authors
 

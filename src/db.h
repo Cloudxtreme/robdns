@@ -4,14 +4,24 @@
 extern "C" {
 #endif
 #include <stdint.h>
+#include <stdlib.h>
+#include <stddef.h>
 #include "domainname.h"
 struct Source;
 struct Catalog;
 
 /**
- * Create a new/empty DNS database with no zones or names
+ * Create a new/empty DNS database with no zones or names.
  */
 struct Catalog *catalog_create();
+
+/**
+ * Reset the hashtable for the zones, in case we are holding
+ * thousands instead of hundreds
+ */
+void
+catalog_reset_zonecount(struct Catalog *db, unsigned new_count);
+
 
 /**
  * Free all the memory used in the DNS database, including
@@ -43,19 +53,22 @@ const struct DBZone *
 catalog_create_zone(
     struct Catalog *catalog,
     const struct DB_XDomain *xdomain,
-    uint64_t filesize
+    uint64_t filesize,
+    const char *filename
     );
 
 /* called with an SOA record to create a zone */    
 const struct DBZone *
-catalog_create_zone2(struct Catalog *db, struct DomainPointer domain, struct DomainPointer origin, uint64_t filesize);
+catalog_create_zone2(struct Catalog *db, 
+    struct DomainPointer domain, struct DomainPointer origin, 
+    uint64_t filesize, const char *filename);
 
 
 
 /* "longest suffix" search for best matching zone */
 struct DBZone *
 catalog_lookup_zone(
-    struct Catalog *db,
+    const struct Catalog *db,
     const struct DB_XDomain *xdomain
     );
 struct DBZone *

@@ -13,6 +13,7 @@ struct DNS_ResponseRRset
 struct DNS_OutgoingResponse
 {
     unsigned id;
+    unsigned is_version_bind:1;
     unsigned aa:1;
     unsigned ra:1;
     unsigned tc:1;
@@ -30,9 +31,13 @@ struct DNS_OutgoingResponse
 };
 
 enum {
-    RCODE_OK=0,
-    RCODE_NXDOMAIN=3,
+    RCODE_OK        =   0,
+    RCODE_FORMERR   =   1,
+    RCODE_NXDOMAIN  =   3,
+    RCODE_REFUSED   =   5,
 };
+
+
 
 enum {
     SECTION_ANSWER=1,
@@ -40,7 +45,11 @@ enum {
     SECTION_ADDITIONAL,
 };
 
-
-void dns_format_response(struct DNS_OutgoingResponse *response, struct Packet *pkt);
+/**
+ * Convert the internal representation of a response into the external
+ * form, formatting a DNS response packet
+ */
+void dns_format_response(struct DNS_OutgoingResponse *response, 
+                         struct Packet *pkt);
 
 #endif

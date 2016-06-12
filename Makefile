@@ -17,8 +17,8 @@ endif
 # my regularly regression-test environment. That means at any point
 # in time, something might be minorly broken in Mac OS X.
 ifneq (, $(findstring darwin, $(SYS)))
-LIBS = -lpcap -lm -rdynamic
-INCLUDES = -I.
+LIBS = -lpcap -lm 
+INCLUDES =
 FLAGS2 = 
 endif
 
@@ -29,7 +29,7 @@ endif
 # to then fix all the errors, so this kinda works now. It's not the
 # intended environment, so it make break in the future.
 ifneq (, $(findstring mingw, $(SYS)))
-INCLUDES = -I. -Ivs10/include
+INCLUDES = -Ivs10/include
 LIBS = -lIPHLPAPI -lWs2_32
 FLAGS2 = -march=i686
 endif
@@ -55,7 +55,7 @@ endif
 CC = gcc
 
 DEFINES = 
-CFLAGS = -g -ggdb $(FLAGS2) $(INCLUDES) $(DEFINES) -Wall -O3 -Wno-format -fno-strict-aliasing
+CFLAGS = -g $(FLAGS2) $(INCLUDES) $(DEFINES) -Wall -O3
 .SUFFIXES: .c .cpp
 
 # just compile everything in the 'src' directory. Using this technique
@@ -77,6 +77,9 @@ clean:
 
 regress: bin/robdns
 	bin/robdns --selftest
+
+test: regress
+
 
 install: bin/robdns
 	echo "No install, binary is bin/robdns"
